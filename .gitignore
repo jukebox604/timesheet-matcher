@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# Node
+node_modules/
+node_modules
+frontend/node_modules/
+
+# Build output
+backend/frontend/dist/
+
+# Backup dirs
+backend.backup.*/
+
+# Secrets
+google-oauth.json
+
+# Data
+data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp/working files
+*.temp*
+*.bak.*
+
+# Build output (keep source, not dist)
+dist/
+frontend/dist/
+backend/frontend/dist/
+
+# Docker compose backup
+docker-compose.yml.bak*
