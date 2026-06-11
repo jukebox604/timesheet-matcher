@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { fetchEvents, fetchProjects, fetchTasks, submitMatchedEntries, runTimesheetFiller, type EventItem, type TeamworkProject, type TeamworkTask } from './timesheet'
 
 interface MatchEntry {
@@ -495,6 +495,7 @@ export default function Events() {
   const [actionStatus, setActionStatus] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [runningFiller, setRunningFiller] = useState(false)
+  const runningFillerRef = useRef(false)
 
   const loadTasksForProject = useCallback(async (projectId: number): Promise<TeamworkTask[]> => {
     if (tasks[projectId]) return tasks[projectId]
@@ -644,6 +645,11 @@ export default function Events() {
   }
 
   const handleTimesheetFiller = async () => {
+    if (runningFillerRef.current) {
+      setActionStatus('Time Sheet Filler is already running. Ignoring duplicate click.')
+      return
+    }
+    runningFillerRef.current = true
     setRunningFiller(true)
     setActionStatus('Creating timesheet filler entries…')
     try {
@@ -653,6 +659,7 @@ export default function Events() {
     } catch (e) {
       setActionStatus((e as Error).message)
     } finally {
+      runningFillerRef.current = false
       setRunningFiller(false)
     }
   }
