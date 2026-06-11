@@ -1,0 +1,7 @@
+fastapi
+httpx
+uvicorn[standard]
+python-jose[cryptography]
+pydantic
+google-auth
+requests
