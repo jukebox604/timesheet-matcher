@@ -2,6 +2,7 @@ from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -27,6 +28,7 @@ FILLER_START_TIME = "20:00"
 FILLER_HOURS = 1
 FILLER_MINUTES = 30
 FILLER_BILLABLE = "0"
+FILLER_TIMEZONE = ZoneInfo("America/Vancouver")
 FILLER_LOCKS: dict[str, Lock] = {}
 FILLER_LOCKS_GUARD = Lock()
 
@@ -41,11 +43,24 @@ def _parse_date(value: str) -> datetime:
 
 
 def _entry_date(entry: dict[str, Any]) -> str:
-    raw = entry.get("date") or entry.get("dateCreated") or entry.get("createdAt") or entry.get("updatedAt") or ""
+    raw = entry.get("date") or ""
     value = str(raw)[:10].replace("/", "-")
     if len(value) == 8 and value.isdigit():
         return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
-    return value
+    if value:
+        return value
+
+    # Teamwork v3 timelogs often omit `date` and only return UTC `timeLogged`.
+    # A Vancouver 20:00 filler entry appears as 03:00Z on the following day,
+    # so convert back to the user's local date before duplicate checks.
+    time_logged = str(entry.get("timeLogged") or entry.get("time-logged") or "")
+    if time_logged:
+        try:
+            parsed = datetime.fromisoformat(time_logged.replace("Z", "+00:00"))
+            return parsed.astimezone(FILLER_TIMEZONE).date().isoformat()
+        except Exception:
+            return time_logged[:10]
+    return ""
 
 
 def _entry_task_id(entry: dict[str, Any]) -> str:
@@ -364,7 +379,8 @@ def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
                 workdays.append(cursor)
             cursor += timedelta(days=1)
 
-        existing = _existing_timelogs(client, start, end, user_id)
+        existing_end = (end_date + timedelta(days=1)).isoformat()
+        existing = _existing_timelogs(client, start, existing_end, user_id)
         existing_filler_dates = sorted({
             day.isoformat()
             for day in workdays
