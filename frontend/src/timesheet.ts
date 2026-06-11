@@ -71,7 +71,7 @@ export async function submitMatchedEntries(entries: SubmitMatchedEntry[]): Promi
   return res.json()
 }
 
-export async function runTimesheetFiller(start: string, end: string): Promise<{ status: string; created: unknown[]; skipped: unknown[]; dailyTotals: Record<string, number> }> {
+export async function runTimesheetFiller(start: string, end: string): Promise<{ status: string; message?: string; created: unknown[]; skipped: unknown[]; existingDates?: string[]; dailyTotals: Record<string, number> }> {
   const res = await post('/api/teamwork/timesheet-filler', { start, end })
   return res.json()
 }

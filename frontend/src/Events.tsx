@@ -648,7 +648,7 @@ export default function Events() {
     setActionStatus('Creating timesheet filler entries…')
     try {
       const result = await runTimesheetFiller(start, end)
-      setActionStatus(`Timesheet filler: created ${result.created.length}; skipped ${result.skipped.length}.`)
+      setActionStatus(result.message || `Timesheet filler: created ${result.created.length}; skipped ${result.skipped.length}.`)
       await handleLoad()
     } catch (e) {
       setActionStatus((e as Error).message)

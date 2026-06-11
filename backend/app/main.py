@@ -1,4 +1,4 @@
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
 from typing import Any
 
@@ -39,12 +39,22 @@ def _parse_date(value: str) -> datetime:
 
 def _entry_date(entry: dict[str, Any]) -> str:
     raw = entry.get("date") or entry.get("dateCreated") or entry.get("createdAt") or entry.get("updatedAt") or ""
-    return str(raw)[:10].replace("/", "-")
+    value = str(raw)[:10].replace("/", "-")
+    if len(value) == 8 and value.isdigit():
+        return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
+    return value
 
 
 def _entry_task_id(entry: dict[str, Any]) -> str:
-    task = entry.get("task") or entry.get("todo-item") or {}
-    return str(entry.get("taskId") or entry.get("task-id") or task.get("id") or "")
+    task = entry.get("task") or entry.get("todo-item") or entry.get("todoItem") or {}
+    return str(
+        entry.get("taskId")
+        or entry.get("task-id")
+        or entry.get("todoItemId")
+        or entry.get("todo-item-id")
+        or task.get("id")
+        or ""
+    )
 
 
 def _entry_description(entry: dict[str, Any]) -> str:
@@ -324,35 +334,67 @@ def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
     if end_date < start_date:
         raise HTTPException(status_code=400, detail="end must be on or after start")
 
-    existing = _existing_timelogs(client, start, end, user_id)
-    created: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
+    workdays: list[date] = []
     cursor = start_date
     while cursor <= end_date:
         if cursor.weekday() < 5:
-            date_key = cursor.isoformat()
-            if any(_entry_matches(e, date=date_key, task_id=FILLER_TASK_ID, description=FILLER_DESCRIPTION) for e in existing):
-                skipped.append({"date": date_key, "reason": "duplicate exists"})
-            else:
-                time_entry = {
-                    "description": FILLER_DESCRIPTION,
-                    "person-id": str(user_id),
-                    "date": cursor.strftime("%Y%m%d"),
-                    "time": FILLER_START_TIME,
-                    "hours": str(FILLER_HOURS),
-                    "minutes": str(FILLER_MINUTES),
-                    "isbillable": FILLER_BILLABLE,
-                }
-                try:
-                    result = client.create_task_time_entry(FILLER_TASK_ID, time_entry)
-                    created.append({"date": date_key, "taskId": FILLER_TASK_ID, "result": result})
-                except Exception as exc:
-                    skipped.append({"date": date_key, "reason": str(exc)})
+            workdays.append(cursor)
         cursor += timedelta(days=1)
+
+    existing = _existing_timelogs(client, start, end, user_id)
+    existing_filler_dates = sorted({
+        day.isoformat()
+        for day in workdays
+        if any(_entry_matches(e, date=day.isoformat(), task_id=FILLER_TASK_ID, description=FILLER_DESCRIPTION) for e in existing)
+    })
+
+    # If any standard filler entries already exist in the loaded range, do not
+    # create a partial second set. This keeps the button safe and makes the
+    # duplicate state obvious to the user.
+    if existing_filler_dates:
+        verify_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
+        daily_totals = ((verify_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(verify_payload, dict) else {}
+        return {
+            "status": "exists",
+            "message": f"Time Sheet Filler entries already exist for {', '.join(existing_filler_dates)}. No new filler entries were created.",
+            "created": [],
+            "skipped": [
+                {"date": day.isoformat(), "reason": "filler entries already exist in this loaded range"}
+                for day in workdays
+            ],
+            "existingDates": existing_filler_dates,
+            "dailyTotals": daily_totals,
+        }
+
+    created: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for day in workdays:
+        date_key = day.isoformat()
+        time_entry = {
+            "description": FILLER_DESCRIPTION,
+            "person-id": str(user_id),
+            "date": day.strftime("%Y%m%d"),
+            "time": FILLER_START_TIME,
+            "hours": str(FILLER_HOURS),
+            "minutes": str(FILLER_MINUTES),
+            "isbillable": FILLER_BILLABLE,
+        }
+        try:
+            result = client.create_task_time_entry(FILLER_TASK_ID, time_entry)
+            created.append({"date": date_key, "taskId": FILLER_TASK_ID, "result": result})
+        except Exception as exc:
+            skipped.append({"date": date_key, "reason": str(exc)})
 
     verify_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
     daily_totals = ((verify_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(verify_payload, dict) else {}
-    return {"status": "ok", "created": created, "skipped": skipped, "dailyTotals": daily_totals}
+    return {
+        "status": "ok",
+        "message": f"Created {len(created)} Time Sheet Filler entries; skipped {len(skipped)}.",
+        "created": created,
+        "skipped": skipped,
+        "existingDates": [],
+        "dailyTotals": daily_totals,
+    }
 
 
 @app.post("/api/proposals/generate")
