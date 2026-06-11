@@ -511,6 +511,7 @@ export default function Events() {
   const [filter, setFilter] = useState<'all' | 'matched' | 'unmatched'>('all')
   const [matches, setMatches] = useState<Record<string, MatchEntry>>({})
   const [confirmedMatches, setConfirmedMatches] = useState<Record<string, MatchEntry>>({})
+  const [taskSearches, setTaskSearches] = useState<Record<string, string>>({})
   const [projects, setProjects] = useState<TeamworkProject[]>([])
   const [tasks, setTasks] = useState<Record<number, TeamworkTask[]>>({})
   const [loadingTasks, setLoadingTasks] = useState<Record<number, boolean>>({})
@@ -586,6 +587,7 @@ export default function Events() {
       setEvents(loadedEvents)
       setMatches(initialMatches)
       setConfirmedMatches({})
+      setTaskSearches({})
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -615,6 +617,7 @@ export default function Events() {
       delete next[eventId]
       return next
     })
+    setTaskSearches(prev => ({ ...prev, [eventId]: '' }))
     if (projectId) await loadTasksForProject(projectId)
   }
 
@@ -643,6 +646,11 @@ export default function Events() {
       return next
     })
     setConfirmedMatches(prev => {
+      const next = { ...prev }
+      delete next[eventId]
+      return next
+    })
+    setTaskSearches(prev => {
       const next = { ...prev }
       delete next[eventId]
       return next
@@ -743,6 +751,16 @@ export default function Events() {
     return tasks[projectId]?.find(t => t.id === taskId)?.name || tasks[projectId]?.find(t => t.id === taskId)?.content || KNOWN_TASKS[taskId]?.taskName || MATCH_RULES.find(s => s.taskId === taskId)?.taskName || ''
   }
 
+  const filterTasks = (projectTasks: TeamworkTask[], search: string) => {
+    const query = normalizeText(search)
+    if (!query) return projectTasks
+    const terms = query.split(/\s+/).filter(Boolean)
+    return projectTasks.filter(task => {
+      const haystack = normalizeText(`${task.id} ${taskDisplayName(task)}`)
+      return terms.every(term => haystack.includes(term))
+    })
+  }
+
   return (
     <div className="card matching-card">
       <h1 className="card-header">Matching</h1>
@@ -818,6 +836,8 @@ export default function Events() {
             baseSuggestion ? tasks[baseSuggestion.projectId] || [] : []
           )
           const projectTasks = selectedProject ? tasks[selectedProject] || [] : []
+          const taskSearch = taskSearches[ev.id] || ''
+          const filteredProjectTasks = filterTasks(projectTasks, taskSearch)
           const isTasksLoading = selectedProject ? loadingTasks[selectedProject] : false
           const matched = isMatched(ev)
           const selectedProjectName = projectName(selectedProject)
@@ -863,19 +883,28 @@ export default function Events() {
                     <option key={p.id} value={p.id}>{p.name}</option>
                   ))}
                 </select>
-                <select
-                  value={selectedTask ?? ''}
-                  onChange={e => handleSelectTask(ev.id, e.target.value ? Number(e.target.value) : null)}
-                  disabled={!selectedProject || isTasksLoading}
-                >
-                  <option value="">{isTasksLoading ? 'Loading tasks…' : '— Select Task —'}</option>
-                  {selectedTask && !projectTasks.some(t => t.id === selectedTask) && selectedTaskName && (
-                    <option value={selectedTask}>{selectedTaskName}</option>
-                  )}
-                  {projectTasks.map(t => (
-                    <option key={t.id} value={t.id}>{t.name || t.content}</option>
-                  ))}
-                </select>
+                <div className="task-picker">
+                  <input
+                    type="search"
+                    value={taskSearch}
+                    placeholder="Search tasks…"
+                    disabled={!selectedProject || isTasksLoading}
+                    onChange={e => setTaskSearches(prev => ({ ...prev, [ev.id]: e.target.value }))}
+                  />
+                  <select
+                    value={selectedTask ?? ''}
+                    onChange={e => handleSelectTask(ev.id, e.target.value ? Number(e.target.value) : null)}
+                    disabled={!selectedProject || isTasksLoading}
+                  >
+                    <option value="">{isTasksLoading ? 'Loading tasks…' : taskSearch ? `— ${filteredProjectTasks.length} matching tasks —` : '— Select Task —'}</option>
+                    {selectedTask && !filteredProjectTasks.some(t => t.id === selectedTask) && selectedTaskName && (
+                      <option value={selectedTask}>{selectedTaskName}</option>
+                    )}
+                    {filteredProjectTasks.map(t => (
+                      <option key={t.id} value={t.id}>{t.name || t.content}</option>
+                    ))}
+                  </select>
+                </div>
                 <button
                   className="btn btn-primary btn-small"
                   disabled={!selectedProject || !selectedTask}

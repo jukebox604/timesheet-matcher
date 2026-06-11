@@ -459,13 +459,21 @@ body {
 
 .event-actions {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) auto auto;
+  grid-template-columns: minmax(220px, 1fr) minmax(260px, 1.25fr) auto auto;
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
 }
 
-.event-actions select {
+.task-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.event-actions select,
+.event-actions input {
   padding: 9px 12px;
   background: var(--bg-input);
   border: 1px solid var(--border);
@@ -477,8 +485,13 @@ body {
   min-width: 0;
 }
 
-.event-actions select:focus {
+.event-actions select:focus,
+.event-actions input:focus {
   border-color: var(--accent);
+}
+
+.event-actions input::placeholder {
+  color: var(--text-muted);
 }
 
 .event-actions select option {
