@@ -388,6 +388,92 @@ function suggestForEvent(ev: EventItem): SuggestedMatch | null {
   }
 }
 
+const STOP_WORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'this', 'that', 'ticket', 'submission',
+  'medium', 'high', 'low', 'update', 'review', 'meeting', 'does', 'not', 'include',
+])
+
+function taskDisplayName(task: TeamworkTask) {
+  return task.name || task.content || ''
+}
+
+function normalizeCode(code: string) {
+  return code.toUpperCase().replace(/[^A-Z0-9]/g, '')
+}
+
+function extractCodes(text: string) {
+  const matches = text.match(/\b[A-Z]{2,}[\s_-]*\d+[A-Z]?\b/gi) || []
+  return Array.from(new Set(matches.map(normalizeCode)))
+}
+
+function meaningfulWords(text: string) {
+  return normalizeText(text)
+    .split(/[^a-z0-9]+/)
+    .filter(word => word.length >= 3 && !STOP_WORDS.has(word))
+}
+
+function scoreTaskAgainstEvent(task: TeamworkTask, ev: EventItem) {
+  const taskName = taskDisplayName(task)
+  const taskText = normalizeText(taskName)
+  const combined = eventText(ev)
+  const eventCodes = extractCodes([ev.title, ev.description].filter(Boolean).join(' '))
+  const taskCodes = extractCodes(taskName)
+  const hits: string[] = []
+  let score = 0
+
+  for (const code of eventCodes) {
+    if (taskCodes.includes(code) || normalizeCode(taskName).includes(code)) {
+      score += 150
+      hits.push(`code ${code}`)
+    }
+  }
+
+  if (taskText && combined.includes(taskText)) {
+    score += 120
+    hits.push('full task title in event details')
+  }
+
+  const words = meaningfulWords(taskName)
+  if (words.length) {
+    const matchedWords = words.filter(word => combined.includes(word))
+    const coverage = matchedWords.length / words.length
+    if (coverage >= 0.75) {
+      score += 90
+      hits.push(`strong phrase overlap: ${matchedWords.slice(0, 4).join(', ')}`)
+    } else if (coverage >= 0.45) {
+      score += 55
+      hits.push(`partial phrase overlap: ${matchedWords.slice(0, 4).join(', ')}`)
+    }
+  }
+
+  return { score, hits }
+}
+
+function bestTaskSuggestion(ev: EventItem, projectTasks: TeamworkTask[]) {
+  const ranked = projectTasks
+    .map(task => ({ task, ...scoreTaskAgainstEvent(task, ev) }))
+    .filter(result => result.score >= 80)
+    .sort((a, b) => b.score - a.score)
+  return ranked[0] || null
+}
+
+function refineSuggestionWithTasks(ev: EventItem, suggestion: SuggestedMatch | null, projectTasks: TeamworkTask[] = []): SuggestedMatch | null {
+  if (!suggestion) return null
+  if (suggestion.taskId) return suggestion
+  const best = bestTaskSuggestion(ev, projectTasks)
+  if (!best) return suggestion
+  const taskName = taskDisplayName(best.task)
+  const taskReason = best.hits.length ? best.hits.slice(0, 2).join(', ') : 'best task title match'
+  const confidence = Math.min(Math.max(suggestion.confidence, 80) + Math.min(best.score, 150) / 10, 99)
+  return {
+    ...suggestion,
+    taskId: best.task.id,
+    taskName,
+    reason: `${suggestion.reason}; task matched from ${taskReason} · ${Math.round(confidence)}% confidence`,
+    confidence: Math.round(confidence),
+  }
+}
+
 function hasMappedTask(ev: EventItem) {
   const maybe = ev as EventItem & { mappedTaskIds?: unknown }
   return Array.isArray(maybe.mappedTaskIds) && maybe.mappedTaskIds.length > 0
@@ -407,14 +493,17 @@ export default function Events() {
   const [loadingTasks, setLoadingTasks] = useState<Record<number, boolean>>({})
   const [error, setError] = useState('')
 
-  const loadTasksForProject = useCallback(async (projectId: number) => {
-    if (tasks[projectId] || loadingTasks[projectId]) return
+  const loadTasksForProject = useCallback(async (projectId: number): Promise<TeamworkTask[]> => {
+    if (tasks[projectId]) return tasks[projectId]
+    if (loadingTasks[projectId]) return []
     setLoadingTasks(prev => ({ ...prev, [projectId]: true }))
     try {
       const taskList = await fetchTasks(projectId)
       setTasks(prev => ({ ...prev, [projectId]: taskList }))
+      return taskList
     } catch {
       setTasks(prev => ({ ...prev, [projectId]: [] }))
+      return []
     } finally {
       setLoadingTasks(prev => ({ ...prev, [projectId]: false }))
     }
@@ -434,23 +523,40 @@ export default function Events() {
       const loadedEvents = data.events || []
       const initialMatches: Record<string, MatchEntry> = {}
       const suggestedProjectIds = new Set<number>()
+      const baseSuggestions: Record<string, SuggestedMatch> = {}
 
       for (const ev of loadedEvents) {
         const suggestion = suggestForEvent(ev)
         if (suggestion) {
+          baseSuggestions[ev.id] = suggestion
+          suggestedProjectIds.add(suggestion.projectId)
+        }
+      }
+
+      const loadedTaskEntries = await Promise.all(
+        Array.from(suggestedProjectIds).map(async projectId => [projectId, await loadTasksForProject(projectId)] as const)
+      )
+      const loadedTaskMap = Object.fromEntries(loadedTaskEntries) as Record<number, TeamworkTask[]>
+
+      for (const ev of loadedEvents) {
+        const baseSuggestion = baseSuggestions[ev.id]
+        const refinedSuggestion = refineSuggestionWithTasks(
+          ev,
+          baseSuggestion || null,
+          baseSuggestion ? loadedTaskMap[baseSuggestion.projectId] || tasks[baseSuggestion.projectId] || [] : []
+        )
+        if (refinedSuggestion) {
           initialMatches[ev.id] = {
             eventId: ev.id,
-            projectId: suggestion.projectId,
-            taskId: suggestion.taskId || null,
+            projectId: refinedSuggestion.projectId,
+            taskId: refinedSuggestion.taskId || null,
           }
-          suggestedProjectIds.add(suggestion.projectId)
         }
       }
 
       setEvents(loadedEvents)
       setMatches(initialMatches)
       setConfirmedMatches({})
-      await Promise.all(Array.from(suggestedProjectIds).map(projectId => loadTasksForProject(projectId)))
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -608,9 +714,14 @@ export default function Events() {
           const match = matches[ev.id]
           const selectedProject = match?.projectId
           const selectedTask = match?.taskId
+          const baseSuggestion = suggestForEvent(ev)
+          const suggestion = refineSuggestionWithTasks(
+            ev,
+            baseSuggestion,
+            baseSuggestion ? tasks[baseSuggestion.projectId] || [] : []
+          )
           const projectTasks = selectedProject ? tasks[selectedProject] || [] : []
           const isTasksLoading = selectedProject ? loadingTasks[selectedProject] : false
-          const suggestion = suggestForEvent(ev)
           const matched = isMatched(ev)
           const selectedProjectName = projectName(selectedProject)
           const selectedTaskName = taskName(selectedProject, selectedTask)
