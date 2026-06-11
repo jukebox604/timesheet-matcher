@@ -12,6 +12,17 @@ from app.models import init_db, insert_proposal
 from app.matcher import match_and_propose
 from app.auth import router as auth_router
 
+EXCLUDED_MATCHING_EVENT_TITLES = (
+    "am email review",
+    "pm email review",
+    "decompress",
+)
+
+
+def _is_excluded_matching_event(event: dict[str, Any]) -> bool:
+    title = str(event.get("title") or event.get("summary") or "").lower()
+    return any(excluded in title for excluded in EXCLUDED_MATCHING_EVENT_TITLES)
+
 BASE_DIR = Path(__file__).resolve().parents[2]
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 ASSETS_DIR = FRONTEND_DIST / "assets"
@@ -100,7 +111,11 @@ def get_events(
         raise HTTPException(status_code=502, detail=f"Failed to fetch calendars: {exc}")
 
     all_events: list[dict[str, Any]] = []
-    for cal in calendars:
+    # The matching page is driven from Marc's Google-synced calendar. Avoid the
+    # blocked_time calendar here; it is for project-linked time blocks, not the
+    # personal calendar import flow.
+    target_calendars = [cal for cal in calendars if str(cal.get("id")) == "1306"] or calendars
+    for cal in target_calendars:
         cal_id = cal.get("id")
         if not cal_id:
             continue
@@ -120,10 +135,12 @@ def get_events(
                     ev["end_at"] = ev_end.get("dateTime", "")
                 else:
                     ev["end_at"] = str(ev_end)
+                # Frontend expects strings; do not leak Teamwork's nested start/end dicts.
+                ev["start"] = ev.get("start_at", "")
+                ev["end"] = ev.get("end_at", "")
                 # Compute duration in minutes
                 if ev.get("duration_minutes") is None and ev["start_at"] and ev["end_at"]:
                     try:
-                        from datetime import datetime
                         s = datetime.fromisoformat(ev["start_at"].replace("Z", "+00:00"))
                         e = datetime.fromisoformat(ev["end_at"].replace("Z", "+00:00"))
                         ev["duration_minutes"] = int((e - s).total_seconds() / 60)
@@ -133,8 +150,30 @@ def get_events(
         except Exception:
             pass
 
+    # Teamwork calendar endpoints can ignore date params; filter on normalized start_at here.
+    try:
+        filter_start = datetime.strptime(start, "%Y-%m-%d").date()
+        filter_end = datetime.strptime(end, "%Y-%m-%d").date()
+        filtered_events: list[dict[str, Any]] = []
+        for ev in all_events:
+            ev_start = str(ev.get("start_at") or ev.get("start") or "")
+            if not ev_start:
+                filtered_events.append(ev)
+                continue
+            try:
+                ev_date = datetime.fromisoformat(ev_start.replace("Z", "+00:00")).date()
+                if filter_start <= ev_date <= filter_end:
+                    filtered_events.append(ev)
+            except Exception:
+                filtered_events.append(ev)
+        all_events = filtered_events
+    except Exception:
+        pass
+
+    all_events = [ev for ev in all_events if not _is_excluded_matching_event(ev)]
+
     # Sort by start_at
-    all_events.sort(key=lambda e: e.get("start_at", ""))
+    all_events.sort(key=lambda e: str(e.get("start_at", "")))
 
     return {
         "query": {"start": start, "end": end},

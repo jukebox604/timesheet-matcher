@@ -1,6 +1,7 @@
 import os
 from typing import Any
 import httpx
+from datetime import datetime
 from difflib import SequenceMatcher
 
 class TeamworkSettings:
@@ -101,14 +102,61 @@ class TeamworkClient:
         start_date: str,
         end_date: str,
     ) -> list[dict[str, Any]]:
-        """Get events (including unavailable blocks) from a calendar."""
+        """Get calendar events using Teamwork's cursor pagination.
+
+        Teamwork's v3 calendar endpoint can ignore date params and returns a
+        cursor stream. Walk pages until we pass the requested end date.
+        """
         base = f"https://{self.settings.site}/projects/api/v3/calendars/{calendar_id}/events.json"
-        data = self._get(base, {
-            "startDate": start_date,
-            "endDate": end_date,
-            "pageSize": 200,
-        })
-        return data.get("events", [])
+        start_bound = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_bound = datetime.strptime(end_date, "%Y-%m-%d").date()
+        cursor: str | None = None
+        events: list[dict[str, Any]] = []
+        max_pages = 150
+
+        def event_date(ev: dict[str, Any]):
+            raw = ev.get("start") or ev.get("startDate") or ev.get("start_at") or ""
+            if isinstance(raw, dict):
+                raw = raw.get("dateTime") or raw.get("date") or ""
+            if not raw:
+                return None
+            try:
+                return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).date()
+            except Exception:
+                return None
+
+        for _ in range(max_pages):
+            params: dict[str, Any] = {
+                "startDate": start_date,
+                "endDate": end_date,
+                "limit": 200,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            data = self._get(base, params)
+            page_events = data.get("events", []) or data.get("calendarEvents", []) or []
+            if not page_events:
+                break
+
+            saw_after_end = False
+            for ev in page_events:
+                d = event_date(ev)
+                if d is None:
+                    events.append(ev)
+                    continue
+                if start_bound <= d <= end_bound:
+                    events.append(ev)
+                if d > end_bound:
+                    saw_after_end = True
+            if saw_after_end:
+                break
+
+            meta = data.get("meta", {}) if isinstance(data, dict) else {}
+            next_cursor = meta.get("nextCursor") if isinstance(meta, dict) else None
+            if not next_cursor:
+                break
+            cursor = next_cursor
+        return events
 
     def list_projects(self) -> list[dict[str, Any]]:
         """List all projects."""
