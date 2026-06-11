@@ -176,6 +176,15 @@ body {
   cursor: pointer;
 }
 
+.week-field input {
+  min-width: 180px;
+}
+
+.week-range-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 /* Buttons */
 .btn {
   padding: 8px 16px;
@@ -215,6 +224,23 @@ body {
 
 .btn-secondary:disabled {
   opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-warning {
+  background: linear-gradient(180deg, #facc15, #f59e0b);
+  color: #1f1300;
+  border: 1px solid rgba(251, 191, 36, 0.7);
+  box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.12), 0 8px 20px rgba(245, 158, 11, 0.14);
+}
+
+.btn-warning:hover {
+  background: linear-gradient(180deg, #fde047, #f59e0b);
+  color: #1f1300;
+}
+
+.btn-warning:disabled {
+  opacity: 0.55;
   cursor: not-allowed;
 }
 

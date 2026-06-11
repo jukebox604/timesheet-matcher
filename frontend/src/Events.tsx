@@ -294,6 +294,29 @@ function currentWorkWeek() {
   return { start: toDateInputValue(monday), end: toDateInputValue(friday) }
 }
 
+function toWeekInputValue(date: Date) {
+  const copy = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()))
+  const day = copy.getUTCDay() || 7
+  copy.setUTCDate(copy.getUTCDate() + 4 - day)
+  const yearStart = new Date(Date.UTC(copy.getUTCFullYear(), 0, 1))
+  const week = Math.ceil((((copy.getTime() - yearStart.getTime()) / 86400000) + 1) / 7)
+  return `${copy.getUTCFullYear()}-W${String(week).padStart(2, '0')}`
+}
+
+function workWeekFromWeekInput(value: string) {
+  const match = value.match(/^(\d{4})-W(\d{2})$/)
+  if (!match) return currentWorkWeek()
+  const year = Number(match[1])
+  const week = Number(match[2])
+  const jan4 = new Date(Date.UTC(year, 0, 4))
+  const jan4Day = jan4.getUTCDay() || 7
+  const monday = new Date(jan4)
+  monday.setUTCDate(jan4.getUTCDate() - jan4Day + 1 + (week - 1) * 7)
+  const friday = new Date(monday)
+  friday.setUTCDate(monday.getUTCDate() + 4)
+  return { start: monday.toISOString().slice(0, 10), end: friday.toISOString().slice(0, 10) }
+}
+
 function normalizeText(value?: string) {
   return (value || '')
     .replace(/<[^>]+>/g, ' ')
@@ -496,6 +519,8 @@ export default function Events() {
   const [submitting, setSubmitting] = useState(false)
   const [runningFiller, setRunningFiller] = useState(false)
   const runningFillerRef = useRef(false)
+  const autoLoadedRef = useRef(false)
+  const selectedWeek = useMemo(() => toWeekInputValue(new Date(`${start}T12:00:00`)), [start])
 
   const loadTasksForProject = useCallback(async (projectId: number): Promise<TeamworkTask[]> => {
     if (tasks[projectId]) return tasks[projectId]
@@ -567,6 +592,18 @@ export default function Events() {
       setLoading(false)
     }
   }, [end, loadTasksForProject, start])
+
+  useEffect(() => {
+    if (autoLoadedRef.current) return
+    autoLoadedRef.current = true
+    void handleLoad()
+  }, [handleLoad])
+
+  const handleWeekChange = (value: string) => {
+    const range = workWeekFromWeekInput(value)
+    setStart(range.start)
+    setEnd(range.end)
+  }
 
   const handleSelectProject = async (eventId: string, projectId: number | null) => {
     setMatches(prev => ({
@@ -711,13 +748,10 @@ export default function Events() {
       <h1 className="card-header">Matching</h1>
 
       <div className="controls-row matching-controls">
-        <div className="field-group">
-          <label>Start</label>
-          <input type="date" value={start} onChange={e => setStart(e.target.value)} />
-        </div>
-        <div className="field-group">
-          <label>End</label>
-          <input type="date" value={end} onChange={e => setEnd(e.target.value)} />
+        <div className="field-group week-field">
+          <label>Week</label>
+          <input type="week" value={selectedWeek} onChange={e => handleWeekChange(e.target.value)} />
+          <span className="week-range-hint">{formatDate(start)} to {formatDate(end)}</span>
         </div>
         <button className="btn btn-primary load-events-btn" onClick={handleLoad} disabled={loading}>
           {loading ? 'Loading…' : 'Load Events'}
@@ -730,7 +764,7 @@ export default function Events() {
             <option value="unmatched">Unmatched ({events.length - matchedCount})</option>
           </select>
         </div>
-        <button className="btn btn-secondary load-events-btn" onClick={handleTimesheetFiller} disabled={runningFiller || loading}>
+        <button className="btn btn-warning load-events-btn" onClick={handleTimesheetFiller} disabled={runningFiller || loading}>
           {runningFiller ? 'Running…' : 'Time Sheet Filler'}
         </button>
         <button className="btn btn-primary load-events-btn" onClick={handleSubmitMatched} disabled={submitting || loading}>
@@ -762,7 +796,7 @@ export default function Events() {
 
       {events.length === 0 && !loading && !error && (
         <div className="empty-state">
-          <p>Current work week is selected by default. Click <strong>Load Events</strong> to import calendar events.</p>
+          <p>Current work week loads automatically. Use the <strong>Week</strong> picker above to switch weeks.</p>
         </div>
       )}
 
