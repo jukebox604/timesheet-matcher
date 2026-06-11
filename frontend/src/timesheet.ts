@@ -7,6 +7,7 @@ export interface EventItem {
   duration_minutes?: number
   _calendar_name?: string
   type?: string
+  mappedTaskIds?: number[] | null
 }
 
 export interface TeamworkProject {

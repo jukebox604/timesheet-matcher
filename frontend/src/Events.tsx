@@ -13,162 +13,268 @@ interface SuggestedMatch {
   taskId: number
   taskName: string
   reason: string
+  confidence: number
 }
 
 const WORK_WEEK_TARGET_MINUTES = 40 * 60
 
-const SUGGESTIONS: Array<SuggestedMatch & { keywords: string[] }> = [
+interface MatchRule extends SuggestedMatch {
+  titleKeywords?: string[]
+  detailKeywords?: string[]
+  taskKeywords?: string[]
+  priority?: number
+}
+
+const KNOWN_TASKS: Record<number, SuggestedMatch> = {
+  29936460: { projectId: 417162, projectName: 'DG | Internal Activities', taskId: 29936460, taskName: 'General Administrative Tasks', reason: 'Known Teamwork task mapping', confidence: 100 },
+  32008552: { projectId: 861705, projectName: 'AHERN | Application Managed Services', taskId: 32008552, taskName: 'IDM', reason: 'Known Teamwork task mapping', confidence: 100 },
+  31545410: { projectId: 861705, projectName: 'AHERN | Application Managed Services', taskId: 31545410, taskName: 'Meetings', reason: 'Known Teamwork task mapping', confidence: 100 },
+  32043629: { projectId: 956015, projectName: 'ASR | Application Managed Services', taskId: 32043629, taskName: 'Daily/Weekly/Ad-hoc Meetings', reason: 'Known Teamwork task mapping', confidence: 100 },
+  32676546: { projectId: 966753, projectName: 'ASR | Dispatch Advice & Invoicing at Suffix Level', taskId: 32676546, taskName: 'Enhanced 901 for vendor dropships', reason: 'Known Teamwork task mapping', confidence: 100 },
+  32199685: { projectId: 390351, projectName: 'BKC | Application Managed Services', taskId: 32199685, taskName: 'IDM', reason: 'Known Teamwork task mapping', confidence: 100 },
+  33020261: { projectId: 390351, projectName: 'BKC | Application Managed Services', taskId: 33020261, taskName: 'QMS601 Endotoxin Supplement Page', reason: 'Known Teamwork task mapping', confidence: 100 },
+  32200244: { projectId: 502827, projectName: 'BROWN | Application Managed Services', taskId: 32200244, taskName: 'IDM', reason: 'Known Teamwork task mapping', confidence: 100 },
+  32768933: { projectId: 861413, projectName: 'DG | Education and Learning', taskId: 32768933, taskName: 'Infor U training', reason: 'Known Teamwork task mapping', confidence: 100 },
+  32835935: { projectId: 951450, projectName: 'HJ | ERP Transformation Project', taskId: 32835935, taskName: 'HJ Output documents', reason: 'Known Teamwork task mapping', confidence: 100 },
+  32165881: { projectId: 463320, projectName: 'IPC | Application Managed Services', taskId: 32165881, taskName: 'IDM', reason: 'Known Teamwork task mapping', confidence: 100 },
+}
+
+const MATCH_RULES: MatchRule[] = [
   {
-    keywords: ['asr api', 'mass changes', 'kitting'],
+    titleKeywords: ['asr api'],
+    detailKeywords: ['mass changes', 'kitting'],
     projectId: 962004,
     projectName: 'ASR | API Mass Changes & Kitting Updates',
     taskId: 0,
     taskName: 'Select task after loading project tasks',
-    reason: 'ASR API / mass changes / kitting keyword match',
+    reason: 'ASR API / mass changes / kitting found in event details',
+    confidence: 0,
+    priority: 12,
   },
   {
-    keywords: ['shipment advice', 'dispatch advice', 'vendor dropship', 'suffix level', 'enhanced 901'],
+    titleKeywords: ['shipment advice', 'dispatch advice', 'vendor dropship', 'suffix level', 'enhanced 901'],
+    detailKeywords: ['shipment advice', 'dispatch advice', 'vendor dropship', 'suffix level', 'enhanced 901', '901'],
+    taskKeywords: ['enhanced 901', 'vendor dropship'],
     projectId: 966753,
     projectName: 'ASR | Dispatch Advice & Invoicing at Suffix Level',
     taskId: 32676546,
     taskName: 'Enhanced 901 for vendor dropships',
-    reason: 'ASR dispatch / 901 keyword match',
+    reason: 'ASR dispatch / 901 details found',
+    confidence: 0,
+    priority: 11,
   },
   {
-    keywords: ['asraymond', 'as raymond', 'asr weekly connect', 'asr scrum', 'asr connect'],
+    titleKeywords: ['asraymond', 'as raymond', 'asr weekly connect', 'asr scrum', 'asr connect'],
+    detailKeywords: ['asraymond', 'as raymond', 'asr', 'weekly connect', 'scrum'],
+    taskKeywords: ['weekly connect', 'scrum', 'meeting'],
     projectId: 956015,
     projectName: 'ASR | Application Managed Services',
     taskId: 32043629,
     taskName: 'Daily/Weekly/Ad-hoc Meetings',
-    reason: 'ASR meeting keyword match',
+    reason: 'ASR meeting details found',
+    confidence: 0,
+    priority: 7,
   },
   {
-    keywords: ['brownells', 'brown'],
-    projectId: 502827,
-    projectName: 'BROWN | Application Managed Services',
-    taskId: 32200244,
-    taskName: 'IDM',
-    reason: 'Brownells keyword match',
-  },
-  {
-    keywords: ['berkshire corp', 'bkc', 'qms', 'endotoxin'],
-    projectId: 390351,
-    projectName: 'BKC | Application Managed Services',
-    taskId: 32199685,
-    taskName: 'IDM',
-    reason: 'BKC / QMS keyword match',
-  },
-  {
-    keywords: ['qms601', 'endotoxin supplement'],
+    titleKeywords: ['qms601', 'endotoxin supplement'],
+    detailKeywords: ['qms601', 'endotoxin supplement', 'template modifications', 'output testing'],
+    taskKeywords: ['qms601', 'endotoxin supplement'],
     projectId: 390351,
     projectName: 'BKC | Application Managed Services',
     taskId: 33020261,
     taskName: 'QMS601 Endotoxin Supplement Page',
-    reason: 'QMS601 / endotoxin supplement keyword match',
+    reason: 'QMS601 / endotoxin details found',
+    confidence: 0,
+    priority: 12,
   },
   {
-    keywords: ['berkshire blanket', 'bkb'],
-    projectId: 388354,
-    projectName: 'BKB | Application Managed Services',
-    taskId: 0,
-    taskName: 'Select task after loading project tasks',
-    reason: 'BKB keyword match',
-  },
-  {
-    keywords: ['ipcorp', 'ip corp', 'factory track', 'ftk', 'mp printer', 'shoptraveler'],
-    projectId: 463320,
-    projectName: 'IPC | Application Managed Services',
-    taskId: 32165881,
+    titleKeywords: ['berkshire corp', 'bkc'],
+    detailKeywords: ['berkshire corp', 'bkc', 'qms', 'endotoxin', 'idm'],
+    projectId: 390351,
+    projectName: 'BKC | Application Managed Services',
+    taskId: 32199685,
     taskName: 'IDM',
-    reason: 'IPC / Factory Track keyword match',
+    reason: 'BKC / Berkshire details found',
+    confidence: 0,
+    priority: 8,
   },
   {
-    keywords: ['jpmc', 'phase ii'],
+    titleKeywords: ['brownells', 'brown'],
+    detailKeywords: ['brownells', 'brown', 'flxpoint', 'infor document management', 'idm', 'invoice', 'sow'],
+    projectId: 502827,
+    projectName: 'BROWN | Application Managed Services',
+    taskId: 32200244,
+    taskName: 'IDM',
+    reason: 'Brownells details found',
+    confidence: 0,
+    priority: 8,
+  },
+  {
+    titleKeywords: ['jpmc', 'phase ii'],
+    detailKeywords: ['jpmc', 'phase ii', 'phase 2'],
     projectId: 959894,
     projectName: 'IP Corp | JPMC Phase II SOW',
     taskId: 0,
     taskName: 'Select task after loading project tasks',
-    reason: 'JPMC / Phase II keyword match',
+    reason: 'JPMC / Phase II details found',
+    confidence: 0,
+    priority: 12,
   },
   {
-    keywords: ['herff jones', 'hj ', 'hj-', 'hj:', 'erp transformation', 'output documents'],
+    titleKeywords: ['ipcorp', 'ip corp', 'factory track', 'ftk'],
+    detailKeywords: ['ipcorp', 'ip corp', 'factory track', 'ftk', 'pms241pf', 'mp printer', 'shoptraveler', 'label', 'labels'],
+    taskKeywords: ['factory track', 'label', 'mp printer', 'shoptraveler'],
+    projectId: 463320,
+    projectName: 'IPC | Application Managed Services',
+    taskId: 32165881,
+    taskName: 'IDM',
+    reason: 'IPC / Factory Track details found',
+    confidence: 0,
+    priority: 8,
+  },
+  {
+    titleKeywords: ['herff jones', 'hj ', 'hj-', 'hj:', 'erp transformation'],
+    detailKeywords: ['herff jones', 'erp transformation', 'output documents', 'idm output', 'finance', 'cx idm'],
+    taskKeywords: ['output documents', 'idm output'],
     projectId: 951450,
     projectName: 'HJ | ERP Transformation Project',
     taskId: 32835935,
     taskName: 'HJ Output documents',
-    reason: 'Herff Jones / HJ keyword match',
+    reason: 'Herff Jones / output document details found',
+    confidence: 0,
+    priority: 8,
   },
   {
-    keywords: ['ahern', 'ahern family'],
+    titleKeywords: ['ahern'],
+    detailKeywords: ['ahern', 'qps601pf'],
     projectId: 861705,
     projectName: 'AHERN | Application Managed Services',
     taskId: 32008552,
     taskName: 'IDM',
-    reason: 'Ahern keyword match',
+    reason: 'Ahern details found',
+    confidence: 0,
+    priority: 7,
   },
   {
-    keywords: ['champion', 'cpf'],
+    titleKeywords: ['berkshire blanket', 'bkb'],
+    detailKeywords: ['berkshire blanket', 'bkb'],
+    projectId: 388354,
+    projectName: 'BKB | Application Managed Services',
+    taskId: 0,
+    taskName: 'Select task after loading project tasks',
+    reason: 'BKB details found',
+    confidence: 0,
+    priority: 6,
+  },
+  {
+    titleKeywords: ['champion', 'cpf'],
+    detailKeywords: ['champion', 'cpf'],
     projectId: 390355,
     projectName: 'CPF | Application Managed Services',
     taskId: 0,
     taskName: 'Select task after loading project tasks',
-    reason: 'Champion / CPF keyword match',
+    reason: 'Champion / CPF details found',
+    confidence: 0,
+    priority: 6,
   },
   {
-    keywords: ['custom truck', 'ctos'],
+    titleKeywords: ['custom truck', 'ctos'],
+    detailKeywords: ['custom truck', 'ctos'],
     projectId: 923416,
     projectName: 'CTOS | Application Managed Services',
     taskId: 0,
     taskName: 'Select task after loading project tasks',
-    reason: 'Custom Truck / CTOS keyword match',
+    reason: 'Custom Truck / CTOS details found',
+    confidence: 0,
+    priority: 6,
   },
   {
-    keywords: ['grosfillex', 'gfx'],
+    titleKeywords: ['grosfillex', 'gfx'],
+    detailKeywords: ['grosfillex', 'gfx'],
     projectId: 422590,
     projectName: 'GFX | Application Managed Services',
     taskId: 0,
     taskName: 'Select task after loading project tasks',
-    reason: 'Grosfillex / GFX keyword match',
+    reason: 'Grosfillex / GFX details found',
+    confidence: 0,
+    priority: 6,
   },
   {
-    keywords: ['mac papers', 'mpp'],
+    titleKeywords: ['mac papers', 'mpp'],
+    detailKeywords: ['mac papers', 'mac papers and packaging', 'mpp'],
     projectId: 898506,
     projectName: 'MPP | Application Managed Services',
     taskId: 0,
     taskName: 'Select task after loading project tasks',
-    reason: 'Mac Papers / MPP keyword match',
+    reason: 'Mac Papers / MPP details found',
+    confidence: 0,
+    priority: 6,
   },
   {
-    keywords: ['macarthur', 'macar'],
+    titleKeywords: ['macarthur', 'macar'],
+    detailKeywords: ['macarthur', 'macar'],
     projectId: 862689,
     projectName: 'MACAR | Application Managed Services',
     taskId: 0,
     taskName: 'Select task after loading project tasks',
-    reason: 'MacArthur keyword match',
+    reason: 'MacArthur details found',
+    confidence: 0,
+    priority: 6,
   },
   {
-    keywords: ['sani marc'],
+    titleKeywords: ['sani marc'],
+    detailKeywords: ['sani marc'],
     projectId: 882196,
     projectName: 'Sani Marc | Cloud Migration',
     taskId: 0,
     taskName: 'Select task after loading project tasks',
-    reason: 'Sani Marc keyword match',
+    reason: 'Sani Marc details found',
+    confidence: 0,
+    priority: 6,
   },
   {
-    keywords: ['teamwork', 'teamdesk', 'slack', 'jira', 'email', 'admin'],
-    projectId: 417162,
-    projectName: 'DG | Internal Activities',
-    taskId: 29936460,
-    taskName: 'General Administrative Tasks',
-    reason: 'Doppio admin keyword match',
+    titleKeywords: ['stratas', 'stratasfoods'],
+    detailKeywords: ['stratas', 'stratasfoods', 'sfcu', 'stratas foods'],
+    projectId: 928509,
+    projectName: 'STRATAS | Application Managed Services',
+    taskId: 0,
+    taskName: 'Select task after loading project tasks',
+    reason: 'STRATAS details found',
+    confidence: 0,
+    priority: 6,
   },
   {
-    keywords: ['mes training', 'infor u', 'training'],
+    titleKeywords: ['wencor'],
+    detailKeywords: ['wencor', 'sublot'],
+    projectId: 914508,
+    projectName: 'WENCOR | Application Managed Services',
+    taskId: 0,
+    taskName: 'Select task after loading project tasks',
+    reason: 'WENCOR details found',
+    confidence: 0,
+    priority: 6,
+  },
+  {
+    titleKeywords: ['mes training', 'infor u'],
+    detailKeywords: ['mes training', 'infor u', 'training', 'manufacturing training'],
     projectId: 861413,
     projectName: 'DG | Education and Learning',
     taskId: 32768933,
     taskName: 'Infor U training',
-    reason: 'Training keyword match',
+    reason: 'Training details found',
+    confidence: 0,
+    priority: 5,
+  },
+  {
+    titleKeywords: ['teamwork', 'teamdesk', 'slack', 'jira'],
+    detailKeywords: ['teamwork', 'teamdesk', 'slack', 'jira', 'admin'],
+    projectId: 417162,
+    projectName: 'DG | Internal Activities',
+    taskId: 29936460,
+    taskName: 'General Administrative Tasks',
+    reason: 'Doppio admin details found',
+    confidence: 0,
+    priority: 3,
   },
 ]
 
@@ -188,8 +294,25 @@ function currentWorkWeek() {
   return { start: toDateInputValue(monday), end: toDateInputValue(friday) }
 }
 
+function normalizeText(value?: string) {
+  return (value || '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+}
+
+function eventTitleText(ev: EventItem) {
+  return normalizeText([ev.title, ev.type].filter(Boolean).join(' '))
+}
+
+function eventDetailText(ev: EventItem) {
+  return normalizeText([ev.description, ev._calendar_name].filter(Boolean).join(' '))
+}
+
 function eventText(ev: EventItem) {
-  return [ev.title, ev.description, ev.type, ev._calendar_name].filter(Boolean).join(' ').toLowerCase()
+  return normalizeText([ev.title, ev.description, ev.type, ev._calendar_name].filter(Boolean).join(' '))
 }
 
 function cleanDescription(description?: string) {
@@ -197,12 +320,72 @@ function cleanDescription(description?: string) {
   return description.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || 'No description provided.'
 }
 
+function keywordHits(text: string, keywords: string[] = []) {
+  return keywords.filter(keyword => text.includes(keyword.toLowerCase()))
+}
+
+function suggestedFromKnownMappedTask(ev: EventItem): SuggestedMatch | null {
+  const maybe = ev as EventItem & { mappedTaskIds?: unknown }
+  if (!Array.isArray(maybe.mappedTaskIds)) return null
+  for (const rawId of maybe.mappedTaskIds) {
+    const taskId = Number(rawId)
+    if (KNOWN_TASKS[taskId]) {
+      return {
+        ...KNOWN_TASKS[taskId],
+        reason: `Already linked in Teamwork calendar to ${KNOWN_TASKS[taskId].taskName}`,
+        confidence: 100,
+      }
+    }
+  }
+  return null
+}
+
+function scoreRule(rule: MatchRule, ev: EventItem) {
+  const title = eventTitleText(ev)
+  const details = eventDetailText(ev)
+  const combined = eventText(ev)
+  const titleHits = keywordHits(title, rule.titleKeywords)
+  const detailHits = keywordHits(details, rule.detailKeywords)
+  const taskHits = keywordHits(combined, rule.taskKeywords)
+  let score = rule.priority || 0
+  score += titleHits.length * 60
+  score += detailHits.length * 50
+  score += taskHits.length * 40
+
+  // Prefer rules that can pick a concrete task over project-only suggestions.
+  if (rule.taskId) score += 15
+
+  return {
+    score,
+    hits: [...titleHits.map(h => `title: ${h}`), ...detailHits.map(h => `description: ${h}`), ...taskHits.map(h => `task clue: ${h}`)],
+  }
+}
+
 function suggestForEvent(ev: EventItem): SuggestedMatch | null {
-  const text = eventText(ev)
-  const hit = SUGGESTIONS.find(s => s.keywords.some(k => text.includes(k)))
-  if (!hit) return null
-  const { keywords, ...suggestion } = hit
-  return suggestion
+  const mapped = suggestedFromKnownMappedTask(ev)
+  if (mapped) return mapped
+
+  const ranked = MATCH_RULES
+    .map(rule => ({ rule, ...scoreRule(rule, ev) }))
+    .filter(result => result.score >= 55)
+    .sort((a, b) => b.score - a.score)
+
+  const top = ranked[0]
+  if (!top) return null
+  const { rule, score, hits } = top
+  const confidence = Math.min(Math.round(score), 99)
+  const reason = hits.length
+    ? `${rule.reason}: ${hits.slice(0, 3).join(', ')}`
+    : rule.reason
+
+  return {
+    projectId: rule.projectId,
+    projectName: rule.projectName,
+    taskId: rule.taskId,
+    taskName: rule.taskName,
+    reason: `${reason} · ${confidence}% confidence`,
+    confidence,
+  }
 }
 
 function hasMappedTask(ev: EventItem) {
@@ -353,12 +536,12 @@ export default function Events() {
 
   const projectName = (projectId?: number | null) => {
     if (!projectId) return ''
-    return projects.find(p => p.id === projectId)?.name || SUGGESTIONS.find(s => s.projectId === projectId)?.projectName || ''
+    return projects.find(p => p.id === projectId)?.name || MATCH_RULES.find(s => s.projectId === projectId)?.projectName || Object.values(KNOWN_TASKS).find(s => s.projectId === projectId)?.projectName || ''
   }
 
   const taskName = (projectId?: number | null, taskId?: number | null) => {
     if (!projectId || !taskId) return ''
-    return tasks[projectId]?.find(t => t.id === taskId)?.name || tasks[projectId]?.find(t => t.id === taskId)?.content || SUGGESTIONS.find(s => s.taskId === taskId)?.taskName || ''
+    return tasks[projectId]?.find(t => t.id === taskId)?.name || tasks[projectId]?.find(t => t.id === taskId)?.content || KNOWN_TASKS[taskId]?.taskName || MATCH_RULES.find(s => s.taskId === taskId)?.taskName || ''
   }
 
   return (
