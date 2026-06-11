@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,12 +16,73 @@ EXCLUDED_MATCHING_EVENT_TITLES = (
     "am email review",
     "pm email review",
     "decompress",
+    "personal commitment",
 )
+
+FILLER_PROJECT_ID = 417162
+FILLER_TASK_ID = 29936460
+FILLER_DESCRIPTION = "Teamwork, Teamdesk, Slack, Email and Jira"
+FILLER_START_TIME = "20:00"
+FILLER_HOURS = 1
+FILLER_MINUTES = 30
+FILLER_BILLABLE = "0"
 
 
 def _is_excluded_matching_event(event: dict[str, Any]) -> bool:
     title = str(event.get("title") or event.get("summary") or "").lower()
     return any(excluded in title for excluded in EXCLUDED_MATCHING_EVENT_TITLES)
+
+
+def _parse_date(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%d")
+
+
+def _entry_date(entry: dict[str, Any]) -> str:
+    raw = entry.get("date") or entry.get("dateCreated") or entry.get("createdAt") or entry.get("updatedAt") or ""
+    return str(raw)[:10].replace("/", "-")
+
+
+def _entry_task_id(entry: dict[str, Any]) -> str:
+    task = entry.get("task") or entry.get("todo-item") or {}
+    return str(entry.get("taskId") or entry.get("task-id") or task.get("id") or "")
+
+
+def _entry_description(entry: dict[str, Any]) -> str:
+    return str(entry.get("description") or entry.get("body") or "")
+
+
+def _entry_matches(entry: dict[str, Any], *, date: str, task_id: int | str, description: str | None = None) -> bool:
+    if _entry_date(entry) != date:
+        return False
+    if _entry_task_id(entry) != str(task_id):
+        return False
+    if description is not None and _entry_description(entry).strip() != description.strip():
+        return False
+    return True
+
+
+def _existing_timelogs(client: TeamworkClient, start: str, end: str, user_id: str) -> list[dict[str, Any]]:
+    payload = client.get_time_entries(start_date=start, end_date=end, user_id=user_id)
+    return payload.get("timelogs", []) or payload.get("timeEntries", []) or payload.get("time-entries", []) or []
+
+
+def _calendar_timelog_payload(entry: dict[str, Any]) -> dict[str, Any]:
+    start_at = str(entry.get("start") or entry.get("start_at") or "")
+    date = str(entry.get("date") or start_at[:10])
+    time = str(entry.get("time") or (start_at[11:19] if len(start_at) >= 19 else "09:00:00"))
+    if len(time) == 5:
+        time = f"{time}:00"
+    return {
+        "date": date,
+        "time": time,
+        "hasStartTime": True,
+        "minutes": int(entry.get("minutes") or entry.get("duration_minutes") or 0),
+        "description": str(entry.get("description") or f"Event: {entry.get('title', '')}"),
+        "projectId": int(entry["projectId"]),
+        "taskId": int(entry["taskId"]),
+        "isBillable": bool(entry.get("isBillable", False)),
+    }
+
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
@@ -123,6 +184,7 @@ def get_events(
             events = client.get_calendar_events(cal_id, start, end)
             for ev in events:
                 ev["_calendar_name"] = cal.get("name", "")
+                ev["calendarId"] = cal_id
                 # Normalize field names
                 ev["title"] = ev.get("summary", ev.get("title", ""))
                 ev_start = ev.get("start", {})
@@ -204,6 +266,93 @@ def list_tasks(project_id: int) -> dict[str, object]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     return {"tasks": tasks}
+
+
+@app.post("/api/teamwork/submit-matched")
+def submit_matched(payload: dict[str, Any]) -> dict[str, object]:
+    teamwork_settings = get_teamwork_settings()
+    if not teamwork_settings.has_credentials:
+        raise HTTPException(status_code=503, detail="Teamwork is not configured")
+    client = TeamworkClient(settings=teamwork_settings)
+    entries = payload.get("entries") or []
+    if not isinstance(entries, list):
+        raise HTTPException(status_code=400, detail="entries must be a list")
+
+    created: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        event_id = str(entry.get("eventId") or "")
+        if entry.get("mappedTaskIds"):
+            skipped.append({"eventId": event_id, "reason": "already linked in Teamwork"})
+            continue
+        if not event_id or not entry.get("projectId") or not entry.get("taskId"):
+            skipped.append({"eventId": event_id, "reason": "missing project/task/event id"})
+            continue
+        timelog = _calendar_timelog_payload(entry)
+        if timelog["minutes"] <= 0:
+            skipped.append({"eventId": event_id, "reason": "zero duration"})
+            continue
+        try:
+            result = client.log_calendar_event_time(entry.get("calendarId") or 1306, event_id, timelog)
+            created.append({"eventId": event_id, "taskId": timelog["taskId"], "minutes": timelog["minutes"], "result": result})
+        except Exception as exc:
+            errors.append({"eventId": event_id, "error": str(exc)})
+
+    return {"status": "ok" if not errors else "partial", "created": created, "skipped": skipped, "errors": errors}
+
+
+@app.post("/api/teamwork/timesheet-filler")
+def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
+    teamwork_settings = get_teamwork_settings()
+    if not teamwork_settings.has_credentials:
+        raise HTTPException(status_code=503, detail="Teamwork is not configured")
+    user_id = teamwork_settings.user_id or "531538"
+    start = str(payload.get("start") or "")
+    end = str(payload.get("end") or "")
+    if not start or not end:
+        raise HTTPException(status_code=400, detail="start and end are required")
+
+    client = TeamworkClient(settings=teamwork_settings)
+    try:
+        start_date = _parse_date(start).date()
+        end_date = _parse_date(end).date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="start/end must be YYYY-MM-DD")
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="end must be on or after start")
+
+    existing = _existing_timelogs(client, start, end, user_id)
+    created: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    cursor = start_date
+    while cursor <= end_date:
+        if cursor.weekday() < 5:
+            date_key = cursor.isoformat()
+            if any(_entry_matches(e, date=date_key, task_id=FILLER_TASK_ID, description=FILLER_DESCRIPTION) for e in existing):
+                skipped.append({"date": date_key, "reason": "duplicate exists"})
+            else:
+                time_entry = {
+                    "description": FILLER_DESCRIPTION,
+                    "person-id": str(user_id),
+                    "date": cursor.strftime("%Y%m%d"),
+                    "time": FILLER_START_TIME,
+                    "hours": str(FILLER_HOURS),
+                    "minutes": str(FILLER_MINUTES),
+                    "isbillable": FILLER_BILLABLE,
+                }
+                try:
+                    result = client.create_task_time_entry(FILLER_TASK_ID, time_entry)
+                    created.append({"date": date_key, "taskId": FILLER_TASK_ID, "result": result})
+                except Exception as exc:
+                    skipped.append({"date": date_key, "reason": str(exc)})
+        cursor += timedelta(days=1)
+
+    verify_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
+    daily_totals = ((verify_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(verify_payload, dict) else {}
+    return {"status": "ok", "created": created, "skipped": skipped, "dailyTotals": daily_totals}
 
 
 @app.post("/api/proposals/generate")

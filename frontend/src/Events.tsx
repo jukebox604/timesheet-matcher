@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { fetchEvents, fetchProjects, fetchTasks, type EventItem, type TeamworkProject, type TeamworkTask } from './timesheet'
+import { fetchEvents, fetchProjects, fetchTasks, submitMatchedEntries, runTimesheetFiller, type EventItem, type TeamworkProject, type TeamworkTask } from './timesheet'
 
 interface MatchEntry {
   eventId: string
@@ -492,6 +492,9 @@ export default function Events() {
   const [tasks, setTasks] = useState<Record<number, TeamworkTask[]>>({})
   const [loadingTasks, setLoadingTasks] = useState<Record<number, boolean>>({})
   const [error, setError] = useState('')
+  const [actionStatus, setActionStatus] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [runningFiller, setRunningFiller] = useState(false)
 
   const loadTasksForProject = useCallback(async (projectId: number): Promise<TeamworkTask[]> => {
     if (tasks[projectId]) return tasks[projectId]
@@ -608,6 +611,52 @@ export default function Events() {
     })
   }
 
+  const handleSubmitMatched = async () => {
+    const entries = events
+      .map(ev => ({ ev, match: confirmedMatches[ev.id] }))
+      .filter(({ ev, match }) => match?.projectId && match?.taskId && !hasMappedTask(ev))
+      .map(({ ev, match }) => ({
+        eventId: ev.id,
+        calendarId: ev.calendarId || 1306,
+        title: ev.title,
+        description: ev.description,
+        start: ev.start,
+        duration_minutes: ev.duration_minutes,
+        projectId: Number(match!.projectId),
+        taskId: Number(match!.taskId),
+        mappedTaskIds: ev.mappedTaskIds,
+      }))
+    if (entries.length === 0) {
+      setActionStatus('No newly matched entries to submit. Click Match on entries first.')
+      return
+    }
+    setSubmitting(true)
+    setActionStatus('Submitting matched entries…')
+    try {
+      const result = await submitMatchedEntries(entries)
+      setActionStatus(`Submitted ${result.created.length}; skipped ${result.skipped.length}; errors ${result.errors.length}.`)
+      await handleLoad()
+    } catch (e) {
+      setActionStatus((e as Error).message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const handleTimesheetFiller = async () => {
+    setRunningFiller(true)
+    setActionStatus('Creating timesheet filler entries…')
+    try {
+      const result = await runTimesheetFiller(start, end)
+      setActionStatus(`Timesheet filler: created ${result.created.length}; skipped ${result.skipped.length}.`)
+      await handleLoad()
+    } catch (e) {
+      setActionStatus((e as Error).message)
+    } finally {
+      setRunningFiller(false)
+    }
+  }
+
   const isMatched = useCallback((ev: EventItem) => {
     return Boolean(confirmedMatches[ev.id]?.projectId && confirmedMatches[ev.id]?.taskId) || hasMappedTask(ev)
   }, [confirmedMatches])
@@ -674,6 +723,12 @@ export default function Events() {
             <option value="unmatched">Unmatched ({events.length - matchedCount})</option>
           </select>
         </div>
+        <button className="btn btn-secondary load-events-btn" onClick={handleTimesheetFiller} disabled={runningFiller || loading}>
+          {runningFiller ? 'Running…' : 'Time Sheet Filler'}
+        </button>
+        <button className="btn btn-primary load-events-btn" onClick={handleSubmitMatched} disabled={submitting || loading}>
+          {submitting ? 'Submitting…' : 'Submit Matched'}
+        </button>
       </div>
 
       <div className="week-progress-card">
@@ -692,6 +747,7 @@ export default function Events() {
       </div>
 
       {error && <p className="error-text">{error}</p>}
+      {actionStatus && <p className="action-status-text">{actionStatus}</p>}
 
       <div className="status-text">
         {events.length} events · {matchedCount} matched · {events.length - matchedCount} unmatched

@@ -229,6 +229,16 @@ body {
   margin-bottom: 12px;
 }
 
+.action-status-text {
+  color: var(--text-secondary);
+  background: rgba(129, 140, 248, 0.08);
+  border: 1px solid rgba(129, 140, 248, 0.18);
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
 .week-progress-card {
   margin: -4px 0 18px;
   padding: 14px 16px;

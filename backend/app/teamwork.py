@@ -43,6 +43,8 @@ class TeamworkClient:
         with httpx.Client(timeout=20) as client:
             r = client.post(path, headers={"Accept": "application/json", "Content-Type": "application/json"}, auth=self._auth, json=data)
             r.raise_for_status()
+            if not r.content:
+                return {}
             return r.json()
 
     def get_timesheets(
@@ -171,6 +173,16 @@ class TeamworkClient:
         base = f"https://{self.settings.site}/projects/api/v3/projects/{project_id}/tasks.json"
         data = self._get(base, {"pageSize": 500})
         return data.get("tasks", [])
+
+    def log_calendar_event_time(self, calendar_id: int | str, event_id: str, timelog: dict[str, Any]) -> dict[str, Any]:
+        """Create time from a calendar event so Teamwork can link mappedTaskIds."""
+        base = f"https://{self.settings.site}/projects/api/v3/calendars/{calendar_id}/events/{event_id}/time.json"
+        return self._post(base, {"timelog": timelog})
+
+    def create_task_time_entry(self, task_id: int | str, time_entry: dict[str, Any]) -> dict[str, Any]:
+        """Create a plain task time entry using Teamwork's v1 endpoint."""
+        base = f"https://{self.settings.site}/tasks/{task_id}/time_entries.json"
+        return self._post(base, {"time-entry": time_entry})
 
 
 def teamwork_status_payload() -> dict[str, object]:

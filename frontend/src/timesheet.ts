@@ -6,6 +6,7 @@ export interface EventItem {
   end?: string
   duration_minutes?: number
   _calendar_name?: string
+  calendarId?: number
   type?: string
   mappedTaskIds?: number[] | null
 }
@@ -49,4 +50,28 @@ export async function fetchProjects(): Promise<TeamworkProject[]> {
 export async function fetchTasks(projectId: number): Promise<TeamworkTask[]> {
   const data = await get<{ tasks: TeamworkTask[] }>(`/api/teamwork/projects/${projectId}/tasks`)
   return data.tasks || []
+}
+
+export interface SubmitMatchedEntry {
+  eventId: string
+  calendarId?: number
+  title?: string
+  description?: string
+  start?: string
+  date?: string
+  duration_minutes?: number
+  minutes?: number
+  projectId: number
+  taskId: number
+  mappedTaskIds?: number[] | null
+}
+
+export async function submitMatchedEntries(entries: SubmitMatchedEntry[]): Promise<{ status: string; created: unknown[]; skipped: unknown[]; errors: unknown[] }> {
+  const res = await post('/api/teamwork/submit-matched', { entries })
+  return res.json()
+}
+
+export async function runTimesheetFiller(start: string, end: string): Promise<{ status: string; created: unknown[]; skipped: unknown[]; dailyTotals: Record<string, number> }> {
+  const res = await post('/api/teamwork/timesheet-filler', { start, end })
+  return res.json()
 }
