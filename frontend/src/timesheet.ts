@@ -23,7 +23,9 @@ export interface TeamworkTask {
 }
 
 export async function get<T>(path: string): Promise<T> {
-  const res = await fetch(path)
+  const separator = path.includes('?') ? '&' : '?'
+  const cacheBustedPath = `${path}${separator}_=${Date.now()}`
+  const res = await fetch(cacheBustedPath, { cache: 'no-store' })
   if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`)
   return res.json() as Promise<T>
 }

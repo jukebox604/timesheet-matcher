@@ -4,7 +4,7 @@ from threading import Lock
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -75,6 +75,53 @@ def _entry_task_id(entry: dict[str, Any]) -> str:
     )
 
 
+def _current_timelog_task_dates(client: TeamworkClient, start: str, end: str, user_id: str) -> set[tuple[str, str]] | None:
+    """Return live (local work date, task id) pairs from Teamwork time entries."""
+    try:
+        payload = client.get_time_entries(start, end, user_id)
+    except Exception:
+        return None
+    entries = payload.get("timelogs") or payload.get("timeEntries") or []
+    pairs: set[tuple[str, str]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_date = _entry_date(entry)
+        task_id = _entry_task_id(entry)
+        if entry_date and task_id:
+            pairs.add((entry_date, task_id))
+    return pairs
+
+
+def _event_local_date(event: dict[str, Any]) -> str:
+    raw = str(event.get("start_at") or event.get("start") or "")
+    if not raw:
+        return ""
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(FILLER_TIMEZONE).date().isoformat()
+    except Exception:
+        return raw[:10]
+
+
+def _drop_stale_mapped_task_ids(events: list[dict[str, Any]], live_task_dates: set[tuple[str, str]] | None) -> None:
+    """Teamwork calendar events can keep mappedTaskIds after the timelog is deleted.
+
+    The Matching page treats mappedTaskIds as already logged, so reconcile them
+    against current time entries for the same local work date before returning.
+    """
+    if live_task_dates is None:
+        return
+    for event in events:
+        mapped = event.get("mappedTaskIds")
+        if not isinstance(mapped, list) or not mapped:
+            continue
+        event_date = _event_local_date(event)
+        current = [task_id for task_id in mapped if (event_date, str(task_id)) in live_task_dates]
+        if len(current) != len(mapped):
+            event["staleMappedTaskIds"] = mapped
+            event["mappedTaskIds"] = current
+
+
 def _entry_description(entry: dict[str, Any]) -> str:
     return str(entry.get("description") or entry.get("body") or "")
 
@@ -126,6 +173,16 @@ ASSETS_DIR = FRONTEND_DIST / "assets"
 INDEX_FILE = FRONTEND_DIST / "index.html"
 
 app = FastAPI(title=settings.app_name)
+
+
+@app.middleware("http")
+async def no_store_api_responses(request: Request, call_next) -> Response:
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 # Register auth routes (Google OAuth)
 app.include_router(auth_router)
@@ -269,6 +326,9 @@ def get_events(
         pass
 
     all_events = [ev for ev in all_events if not _is_excluded_matching_event(ev)]
+
+    live_task_dates = _current_timelog_task_dates(client, start, end, teamwork_settings.user_id or "")
+    _drop_stale_mapped_task_ids(all_events, live_task_dates)
 
     # Sort by start_at
     all_events.sort(key=lambda e: str(e.get("start_at", "")))
