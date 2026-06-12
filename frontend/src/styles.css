@@ -300,6 +300,11 @@ body {
   font-size: 18px;
 }
 
+.week-progress-detail {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .week-progress-short {
   color: var(--warning);
   font-size: 14px;

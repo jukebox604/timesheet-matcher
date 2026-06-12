@@ -44,6 +44,11 @@ export async function fetchEvents(start: string, end: string): Promise<{ events:
   return get(`/api/teamwork/events?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`)
 }
 
+export async function fetchTimesheetTotals(start: string, end: string): Promise<Record<string, number>> {
+  const data = await get<{ dailyTotals?: Record<string, number> }>(`/api/teamwork/timesheets?startDate=${encodeURIComponent(start)}&endDate=${encodeURIComponent(end)}`)
+  return data.dailyTotals || {}
+}
+
 export async function fetchProjects(): Promise<TeamworkProject[]> {
   const data = await get<{ projects: TeamworkProject[] }>('/api/teamwork/projects')
   return data.projects || []

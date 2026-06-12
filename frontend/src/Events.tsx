@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { fetchEvents, fetchProjects, fetchTasks, submitMatchedEntries, runTimesheetFiller, type EventItem, type TeamworkProject, type TeamworkTask } from './timesheet'
+import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, runTimesheetFiller, type EventItem, type TeamworkProject, type TeamworkTask } from './timesheet'
 
 interface MatchEntry {
   eventId: string
@@ -507,6 +507,7 @@ export default function Events() {
   const [start, setStart] = useState(defaults.start)
   const [end, setEnd] = useState(defaults.end)
   const [events, setEvents] = useState<EventItem[]>([])
+  const [weeklyLoggedMinutes, setWeeklyLoggedMinutes] = useState(0)
   const [loading, setLoading] = useState(false)
   const [filter, setFilter] = useState<'all' | 'matched' | 'unmatched'>('all')
   const [matches, setMatches] = useState<Record<string, MatchEntry>>({})
@@ -549,8 +550,12 @@ export default function Events() {
     setLoading(true)
     setError('')
     try {
-      const data = await fetchEvents(start, end)
+      const [data, dailyTotals] = await Promise.all([
+        fetchEvents(start, end),
+        fetchTimesheetTotals(start, end),
+      ])
       const loadedEvents = data.events || []
+      const loadedLoggedMinutes = Object.values(dailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0)
       const initialMatches: Record<string, MatchEntry> = {}
       const suggestedProjectIds = new Set<number>()
       const baseSuggestions: Record<string, SuggestedMatch> = {}
@@ -585,6 +590,7 @@ export default function Events() {
       }
 
       setEvents(loadedEvents)
+      setWeeklyLoggedMinutes(loadedLoggedMinutes)
       setMatches(initialMatches)
       setConfirmedMatches({})
       setTaskSearches({})
@@ -714,9 +720,9 @@ export default function Events() {
   }, [confirmedMatches])
 
   const matchedCount = events.filter(isMatched).length
-  const weeklyTotalMinutes = events.reduce((total, ev) => total + (ev.duration_minutes || 0), 0)
-  const weeklyRemainingMinutes = Math.max(WORK_WEEK_TARGET_MINUTES - weeklyTotalMinutes, 0)
-  const weeklyProgressPercent = Math.min((weeklyTotalMinutes / WORK_WEEK_TARGET_MINUTES) * 100, 100)
+  const importedEventMinutes = events.reduce((total, ev) => total + (ev.duration_minutes || 0), 0)
+  const weeklyRemainingMinutes = Math.max(WORK_WEEK_TARGET_MINUTES - weeklyLoggedMinutes, 0)
+  const weeklyProgressPercent = Math.min((weeklyLoggedMinutes / WORK_WEEK_TARGET_MINUTES) * 100, 100)
 
   const filtered = events.filter(e => {
     if (filter === 'matched') return isMatched(e)
@@ -793,8 +799,9 @@ export default function Events() {
       <div className="week-progress-card">
         <div className="week-progress-header">
           <div>
-            <span className="week-progress-label">Weekly target</span>
-            <strong>{formatHours(weeklyTotalMinutes)} / 40.0h</strong>
+            <span className="week-progress-label">Logged this week</span>
+            <strong>{formatHours(weeklyLoggedMinutes)} / 40.0h</strong>
+            <small className="week-progress-detail">{formatHours(importedEventMinutes)} imported calendar time</small>
           </div>
           <div className={weeklyRemainingMinutes > 0 ? 'week-progress-short' : 'week-progress-complete'}>
             {weeklyRemainingMinutes > 0 ? `${formatHours(weeklyRemainingMinutes)} short` : '40h met'}
