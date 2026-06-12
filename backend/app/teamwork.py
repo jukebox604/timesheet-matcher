@@ -169,6 +169,37 @@ class TeamworkClient:
             cursor = next_cursor
         return events
 
+    def get_workload(self, start_date: str, end_date: str) -> dict[str, Any]:
+        base = f"https://{self.settings.site}/projects/api/v3/workload.json"
+        params: dict[str, Any] = {"startDate": start_date, "endDate": end_date, "pageSize": 500, "pageOffset": 0}
+        data = self._get(base, params)
+        meta = data.get("meta", {}) if isinstance(data, dict) else {}
+        while ((meta.get("page") or {}).get("hasMore", False) if isinstance(meta, dict) else False):
+            params["pageOffset"] = int(params.get("pageOffset", 0)) + int(params.get("pageSize", 500))
+            next_data = self._get(base, params)
+            if not isinstance(next_data, dict):
+                break
+            current_users = ((data.get("workload") or {}).get("users") or [])
+            next_users = ((next_data.get("workload") or {}).get("users") or [])
+            data.setdefault("workload", {})["users"] = current_users + next_users
+            meta = next_data.get("meta", {})
+        return data
+
+    def get_calendar_events_generic(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
+        base = f"https://{self.settings.site}/projects/api/v3/calendar/events.json"
+        params: dict[str, Any] = {"startDate": start_date, "endDate": end_date, "pageSize": 500, "pageOffset": 0}
+        data = self._get(base, params)
+        events = data.get("calendarEvents", []) or []
+        meta = data.get("meta", {}) if isinstance(data, dict) else {}
+        while ((meta.get("page") or {}).get("hasMore", False) if isinstance(meta, dict) else False):
+            params["pageOffset"] = int(params.get("pageOffset", 0)) + int(params.get("pageSize", 500))
+            next_data = self._get(base, params)
+            if not isinstance(next_data, dict):
+                break
+            events += next_data.get("calendarEvents", []) or []
+            meta = next_data.get("meta", {})
+        return events
+
     def list_projects(self) -> list[dict[str, Any]]:
         """List all projects."""
         base = f"https://{self.settings.site}/projects/api/v3/projects.json"

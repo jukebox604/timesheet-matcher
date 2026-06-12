@@ -44,9 +44,19 @@ export async function fetchEvents(start: string, end: string): Promise<{ events:
   return get(`/api/teamwork/events?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`)
 }
 
-export async function fetchTimesheetTotals(start: string, end: string): Promise<Record<string, number>> {
-  const data = await get<{ dailyTotals?: Record<string, number> }>(`/api/teamwork/timesheets?startDate=${encodeURIComponent(start)}&endDate=${encodeURIComponent(end)}`)
-  return data.dailyTotals || {}
+export interface TimesheetTotals {
+  dailyTotals: Record<string, number>
+  unavailableDailyTotals: Record<string, number>
+  creditedDailyTotals: Record<string, number>
+}
+
+export async function fetchTimesheetTotals(start: string, end: string): Promise<TimesheetTotals> {
+  const data = await get<Partial<TimesheetTotals>>(`/api/teamwork/timesheets?startDate=${encodeURIComponent(start)}&endDate=${encodeURIComponent(end)}`)
+  return {
+    dailyTotals: data.dailyTotals || {},
+    unavailableDailyTotals: data.unavailableDailyTotals || {},
+    creditedDailyTotals: data.creditedDailyTotals || data.dailyTotals || {},
+  }
 }
 
 export async function fetchProjects(): Promise<TeamworkProject[]> {

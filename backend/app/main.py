@@ -287,6 +287,75 @@ def _calendar_timelog_payload(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _date_strings(start: str, end: str) -> list[str]:
+    try:
+        current = _parse_date(start).date()
+        end_date = _parse_date(end).date()
+    except Exception:
+        return []
+    dates: list[str] = []
+    while current <= end_date:
+        dates.append(current.isoformat())
+        current += timedelta(days=1)
+    return dates
+
+
+def _event_minutes_for_date(event: dict[str, Any], target_date: str) -> int:
+    if event.get("allDay"):
+        return 480
+    start_raw = str(event.get("startDate") or event.get("start") or "")
+    end_raw = str(event.get("endDate") or event.get("end") or "")
+    if start_raw[:10] != target_date:
+        return 0
+    try:
+        start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+        return max(0, int((end_dt - start_dt).total_seconds() / 60))
+    except Exception:
+        return 0
+
+
+def _unavailable_daily_totals(client: TeamworkClient, start: str, end: str, user_id: str) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    dates = _date_strings(start, end)
+    totals = {day: 0 for day in dates}
+    if not dates or not user_id:
+        return totals, []
+    workload = client.get_workload(start, end)
+    users = ((workload.get("workload") or {}).get("users") or []) if isinstance(workload, dict) else []
+    user_row = next((row for row in users if str(row.get("userId") or (row.get("user") or {}).get("id")) == str(user_id)), None)
+    if not user_row:
+        return totals, []
+
+    events_by_id = {str(event.get("id")): event for event in client.get_calendar_events_generic(start, end)}
+    included_events: list[dict[str, Any]] = []
+    seen_events: set[tuple[str, str]] = set()
+    for day, info in (user_row.get("dates") or {}).items():
+        if day not in totals or not isinstance(info, dict):
+            continue
+        event_refs = info.get("events") or []
+        for ref in event_refs:
+            event_id = str((ref or {}).get("id") or "")
+            if not event_id or (day, event_id) in seen_events:
+                continue
+            seen_events.add((day, event_id))
+            event = events_by_id.get(event_id)
+            minutes = _event_minutes_for_date(event or {}, day) if event else 0
+            if minutes <= 0:
+                minutes = int(info.get("capacityMinutes") or 0)
+            if minutes > 0:
+                totals[day] += min(minutes, 480)
+                included_events.append({
+                    "id": event_id,
+                    "date": day,
+                    "minutes": min(minutes, 480),
+                    "title": (event or {}).get("title") or "Unavailable",
+                    "typeId": (event or {}).get("typeId"),
+                    "startDate": (event or {}).get("startDate"),
+                    "endDate": (event or {}).get("endDate"),
+                })
+    return totals, included_events
+
+
 BASE_DIR = Path(__file__).resolve().parents[2]
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 ASSETS_DIR = FRONTEND_DIST / "assets"
@@ -337,23 +406,39 @@ def teamwork_timesheets(
     teamwork_settings = get_teamwork_settings()
     if not teamwork_settings.has_credentials:
         raise HTTPException(status_code=503, detail="Teamwork is not configured")
+    client = TeamworkClient(settings=teamwork_settings)
+    effective_user_id = userId or teamwork_settings.user_id
     try:
-        payload = TeamworkClient(settings=teamwork_settings).get_timesheets(
+        payload = client.get_timesheets(
             start_date=startDate,
             end_date=endDate,
-            user_id=userId,
+            user_id=effective_user_id,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     timesheets = payload.get("timesheets", [])
     meta = payload.get("meta", {}) or {}
     totals = ((meta.get("dailyTotals") or {}) if isinstance(meta, dict) else {})
+    unavailable_totals: dict[str, int] = {}
+    unavailable_events: list[dict[str, Any]] = []
+    if startDate and endDate and effective_user_id:
+        try:
+            unavailable_totals, unavailable_events = _unavailable_daily_totals(client, startDate, endDate, str(effective_user_id))
+        except Exception:
+            unavailable_totals, unavailable_events = {}, []
+    credited_totals = {
+        day: int(totals.get(day, 0) or 0) + int(unavailable_totals.get(day, 0) or 0)
+        for day in sorted(set(totals) | set(unavailable_totals))
+    }
     return {
         "site": teamwork_settings.site,
-        "user_id": userId or teamwork_settings.user_id,
+        "user_id": effective_user_id,
         "query": {"startDate": startDate, "endDate": endDate},
         "count": len(timesheets),
         "dailyTotals": totals,
+        "unavailableDailyTotals": unavailable_totals,
+        "creditedDailyTotals": credited_totals,
+        "unavailableEvents": unavailable_events,
         "timesheets": timesheets,
     }
 

@@ -507,7 +507,9 @@ export default function Events() {
   const [start, setStart] = useState(defaults.start)
   const [end, setEnd] = useState(defaults.end)
   const [events, setEvents] = useState<EventItem[]>([])
+  const [weeklyActualLoggedMinutes, setWeeklyActualLoggedMinutes] = useState(0)
   const [weeklyLoggedMinutes, setWeeklyLoggedMinutes] = useState(0)
+  const [weeklyUnavailableMinutes, setWeeklyUnavailableMinutes] = useState(0)
   const [loading, setLoading] = useState(false)
   const [filter, setFilter] = useState<'all' | 'matched' | 'unmatched'>('all')
   const [matches, setMatches] = useState<Record<string, MatchEntry>>({})
@@ -555,7 +557,9 @@ export default function Events() {
         fetchTimesheetTotals(start, end),
       ])
       const loadedEvents = data.events || []
-      const loadedLoggedMinutes = Object.values(dailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0)
+      const loadedLoggedMinutes = Object.values(dailyTotals.dailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0)
+      const loadedUnavailableMinutes = Object.values(dailyTotals.unavailableDailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0)
+      const loadedCreditedMinutes = Object.values(dailyTotals.creditedDailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0)
       const initialMatches: Record<string, MatchEntry> = {}
       const suggestedProjectIds = new Set<number>()
       const baseSuggestions: Record<string, SuggestedMatch> = {}
@@ -590,7 +594,9 @@ export default function Events() {
       }
 
       setEvents(loadedEvents)
-      setWeeklyLoggedMinutes(loadedLoggedMinutes)
+      setWeeklyActualLoggedMinutes(loadedLoggedMinutes)
+      setWeeklyLoggedMinutes(loadedCreditedMinutes)
+      setWeeklyUnavailableMinutes(loadedUnavailableMinutes)
       setMatches(initialMatches)
       setConfirmedMatches({})
       setTaskSearches({})
@@ -799,9 +805,9 @@ export default function Events() {
       <div className="week-progress-card">
         <div className="week-progress-header">
           <div>
-            <span className="week-progress-label">Logged this week</span>
+            <span className="week-progress-label">Logged + unavailable this week</span>
             <strong>{formatHours(weeklyLoggedMinutes)} / 40.0h</strong>
-            <small className="week-progress-detail">{formatHours(importedEventMinutes)} imported calendar time</small>
+            <small className="week-progress-detail">{formatHours(weeklyActualLoggedMinutes)} logged + {formatHours(weeklyUnavailableMinutes)} unavailable · {formatHours(importedEventMinutes)} imported calendar time</small>
           </div>
           <div className={weeklyRemainingMinutes > 0 ? 'week-progress-short' : 'week-progress-complete'}>
             {weeklyRemainingMinutes > 0 ? `${formatHours(weeklyRemainingMinutes)} short` : '40h met'}
