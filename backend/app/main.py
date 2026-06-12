@@ -22,6 +22,7 @@ EXCLUDED_MATCHING_EVENT_TITLES = (
     "personal commitment",
     "out of office",
 )
+PERSONAL_COMMITMENT_TITLE = "personal commitment"
 
 FILLER_PROJECT_ID = 417162
 FILLER_TASK_ID = 29936460
@@ -38,6 +39,37 @@ FILLER_LOCKS_GUARD = Lock()
 def _is_excluded_matching_event(event: dict[str, Any]) -> bool:
     title = str(event.get("title") or event.get("summary") or "").lower()
     return any(excluded in title for excluded in EXCLUDED_MATCHING_EVENT_TITLES)
+
+
+def _is_personal_commitment_event(event: dict[str, Any]) -> bool:
+    title = str(event.get("title") or event.get("summary") or "").lower()
+    return PERSONAL_COMMITMENT_TITLE in title
+
+
+def _event_datetime_value(event: dict[str, Any], key: str) -> str:
+    raw = event.get(key) or event.get(f"{key}Date") or event.get(f"{key}_at") or ""
+    if isinstance(raw, dict):
+        raw = raw.get("dateTime") or raw.get("date") or ""
+    return str(raw or "")
+
+
+def _parse_event_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=FILLER_TIMEZONE)
+        return parsed
+    except Exception:
+        return None
+
+
+def _event_local_date(event: dict[str, Any]) -> str:
+    parsed = _parse_event_datetime(_event_datetime_value(event, "start"))
+    if not parsed:
+        return ""
+    return parsed.astimezone(FILLER_TIMEZONE).date().isoformat()
 
 
 def _parse_date(value: str) -> datetime:
@@ -104,10 +136,7 @@ def _current_timelogs(client: TeamworkClient, start: str, end: str, user_id: str
 
 
 def _event_start_value(event: dict[str, Any]) -> str:
-    raw = event.get("start_at") or event.get("start") or ""
-    if isinstance(raw, dict):
-        raw = raw.get("dateTime") or raw.get("date") or ""
-    return str(raw)
+    return _event_datetime_value(event, "start")
 
 
 def _event_display_date(event: dict[str, Any]) -> str:
@@ -121,22 +150,19 @@ def _event_start_time(event: dict[str, Any]) -> str:
 
 
 def _event_duration_minutes(event: dict[str, Any]) -> int:
+    if event.get("allDay"):
+        return 480
     raw_minutes = event.get("duration_minutes") or event.get("minutes")
     if raw_minutes is not None:
         try:
-            return int(raw_minutes)
+            return max(0, int(raw_minutes))
         except Exception:
             pass
-    start_at = _event_start_value(event)
-    raw_end = event.get("end_at") or event.get("end") or ""
-    if isinstance(raw_end, dict):
-        raw_end = raw_end.get("dateTime") or raw_end.get("date") or ""
-    try:
-        start_dt = datetime.fromisoformat(str(start_at).replace("Z", "+00:00"))
-        end_dt = datetime.fromisoformat(str(raw_end).replace("Z", "+00:00"))
-        return int((end_dt - start_dt).total_seconds() / 60)
-    except Exception:
+    start_dt = _parse_event_datetime(_event_datetime_value(event, "start"))
+    end_dt = _parse_event_datetime(_event_datetime_value(event, "end"))
+    if not start_dt or not end_dt:
         return 0
+    return max(0, int((end_dt - start_dt).total_seconds() / 60))
 
 
 def _entry_local_time(entry: dict[str, Any]) -> str:
@@ -356,6 +382,34 @@ def _unavailable_daily_totals(client: TeamworkClient, start: str, end: str, user
     return totals, included_events
 
 
+def _personal_commitment_daily_totals(client: TeamworkClient, start: str, end: str) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    dates = _date_strings(start, end)
+    totals = {day: 0 for day in dates}
+    if not dates:
+        return totals, []
+    events: list[dict[str, Any]] = []
+    for event in client.get_calendar_events(1306, start, end):
+        if not _is_personal_commitment_event(event):
+            continue
+        day = _event_local_date(event)
+        if day not in totals:
+            continue
+        minutes = _event_duration_minutes(event)
+        if minutes <= 0:
+            continue
+        totals[day] += minutes
+        events.append({
+            "id": str(event.get("id") or ""),
+            "date": day,
+            "minutes": minutes,
+            "title": event.get("title") or event.get("summary") or "Personal Commitment",
+            "start": _event_datetime_value(event, "start"),
+            "end": _event_datetime_value(event, "end"),
+            "loggedAsUnavailable": False,
+        })
+    return totals, events
+
+
 BASE_DIR = Path(__file__).resolve().parents[2]
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 ASSETS_DIR = FRONTEND_DIST / "assets"
@@ -421,14 +475,24 @@ def teamwork_timesheets(
     totals = ((meta.get("dailyTotals") or {}) if isinstance(meta, dict) else {})
     unavailable_totals: dict[str, int] = {}
     unavailable_events: list[dict[str, Any]] = []
+    personal_commitment_totals: dict[str, int] = {}
+    personal_commitment_events: list[dict[str, Any]] = []
     if startDate and endDate and effective_user_id:
         try:
             unavailable_totals, unavailable_events = _unavailable_daily_totals(client, startDate, endDate, str(effective_user_id))
         except Exception:
             unavailable_totals, unavailable_events = {}, []
+        try:
+            personal_commitment_totals, personal_commitment_events = _personal_commitment_daily_totals(client, startDate, endDate)
+        except Exception:
+            personal_commitment_totals, personal_commitment_events = {}, []
     credited_totals = {
         day: int(totals.get(day, 0) or 0) + int(unavailable_totals.get(day, 0) or 0)
         for day in sorted(set(totals) | set(unavailable_totals))
+    }
+    personal_commitment_unlogged_totals = {
+        day: max(int(personal_commitment_totals.get(day, 0) or 0) - int(unavailable_totals.get(day, 0) or 0), 0)
+        for day in sorted(set(personal_commitment_totals) | set(unavailable_totals))
     }
     return {
         "site": teamwork_settings.site,
@@ -438,7 +502,10 @@ def teamwork_timesheets(
         "dailyTotals": totals,
         "unavailableDailyTotals": unavailable_totals,
         "creditedDailyTotals": credited_totals,
+        "personalCommitmentDailyTotals": personal_commitment_totals,
+        "personalCommitmentUnloggedDailyTotals": personal_commitment_unlogged_totals,
         "unavailableEvents": unavailable_events,
+        "personalCommitmentEvents": personal_commitment_events,
         "timesheets": timesheets,
     }
 

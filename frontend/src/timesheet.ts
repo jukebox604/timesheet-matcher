@@ -48,6 +48,8 @@ export interface TimesheetTotals {
   dailyTotals: Record<string, number>
   unavailableDailyTotals: Record<string, number>
   creditedDailyTotals: Record<string, number>
+  personalCommitmentDailyTotals: Record<string, number>
+  personalCommitmentUnloggedDailyTotals: Record<string, number>
 }
 
 export async function fetchTimesheetTotals(start: string, end: string): Promise<TimesheetTotals> {
@@ -56,6 +58,8 @@ export async function fetchTimesheetTotals(start: string, end: string): Promise<
     dailyTotals: data.dailyTotals || {},
     unavailableDailyTotals: data.unavailableDailyTotals || {},
     creditedDailyTotals: data.creditedDailyTotals || data.dailyTotals || {},
+    personalCommitmentDailyTotals: data.personalCommitmentDailyTotals || {},
+    personalCommitmentUnloggedDailyTotals: data.personalCommitmentUnloggedDailyTotals || data.personalCommitmentDailyTotals || {},
   }
 }
 

@@ -510,6 +510,7 @@ export default function Events() {
   const [weeklyActualLoggedMinutes, setWeeklyActualLoggedMinutes] = useState(0)
   const [weeklyLoggedMinutes, setWeeklyLoggedMinutes] = useState(0)
   const [weeklyUnavailableMinutes, setWeeklyUnavailableMinutes] = useState(0)
+  const [weeklyPersonalCommitmentMinutes, setWeeklyPersonalCommitmentMinutes] = useState(0)
   const [loading, setLoading] = useState(false)
   const [filter, setFilter] = useState<'all' | 'matched' | 'unmatched'>('all')
   const [matches, setMatches] = useState<Record<string, MatchEntry>>({})
@@ -560,6 +561,7 @@ export default function Events() {
       const loadedLoggedMinutes = Object.values(dailyTotals.dailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0)
       const loadedUnavailableMinutes = Object.values(dailyTotals.unavailableDailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0)
       const loadedCreditedMinutes = Object.values(dailyTotals.creditedDailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0)
+      const loadedPersonalCommitmentMinutes = Object.values(dailyTotals.personalCommitmentUnloggedDailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0)
       const initialMatches: Record<string, MatchEntry> = {}
       const suggestedProjectIds = new Set<number>()
       const baseSuggestions: Record<string, SuggestedMatch> = {}
@@ -597,6 +599,7 @@ export default function Events() {
       setWeeklyActualLoggedMinutes(loadedLoggedMinutes)
       setWeeklyLoggedMinutes(loadedCreditedMinutes)
       setWeeklyUnavailableMinutes(loadedUnavailableMinutes)
+      setWeeklyPersonalCommitmentMinutes(loadedPersonalCommitmentMinutes)
       setMatches(initialMatches)
       setConfirmedMatches({})
       setTaskSearches({})
@@ -728,6 +731,7 @@ export default function Events() {
   const matchedCount = events.filter(isMatched).length
   const importedEventMinutes = events.reduce((total, ev) => total + (ev.duration_minutes || 0), 0)
   const weeklyRemainingMinutes = Math.max(WORK_WEEK_TARGET_MINUTES - weeklyLoggedMinutes, 0)
+  const weeklyOverageMinutes = Math.max(weeklyLoggedMinutes - WORK_WEEK_TARGET_MINUTES, 0)
   const weeklyProgressPercent = Math.min((weeklyLoggedMinutes / WORK_WEEK_TARGET_MINUTES) * 100, 100)
 
   const filtered = events.filter(e => {
@@ -808,13 +812,18 @@ export default function Events() {
             <span className="week-progress-label">Logged + unavailable this week</span>
             <strong>{formatHours(weeklyLoggedMinutes)} / 40.0h</strong>
             <small className="week-progress-detail">{formatHours(weeklyActualLoggedMinutes)} logged + {formatHours(weeklyUnavailableMinutes)} unavailable · {formatHours(importedEventMinutes)} imported calendar time</small>
+            {weeklyPersonalCommitmentMinutes > 0 && (
+              <small className="week-progress-warning">
+                {formatHours(weeklyPersonalCommitmentMinutes)} personal commitment not logged as unavailable yet
+              </small>
+            )}
           </div>
-          <div className={weeklyRemainingMinutes > 0 ? 'week-progress-short' : 'week-progress-complete'}>
-            {weeklyRemainingMinutes > 0 ? `${formatHours(weeklyRemainingMinutes)} short` : '40h met'}
+          <div className={weeklyRemainingMinutes > 0 ? 'week-progress-short' : weeklyOverageMinutes > 0 ? 'week-progress-over' : 'week-progress-complete'}>
+            {weeklyRemainingMinutes > 0 ? `${formatHours(weeklyRemainingMinutes)} short` : weeklyOverageMinutes > 0 ? `${formatHours(weeklyOverageMinutes)} over 40h` : '40h met'}
           </div>
         </div>
         <div className="week-progress-track" aria-label="40 hour weekly progress">
-          <div className="week-progress-fill" style={{ width: `${weeklyProgressPercent}%` }} />
+          <div className={`week-progress-fill ${weeklyOverageMinutes > 0 ? 'week-progress-fill-over' : ''}`} style={{ width: `${weeklyProgressPercent}%` }} />
         </div>
       </div>
 
