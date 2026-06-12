@@ -1,4 +1,5 @@
 from datetime import datetime, timezone, timedelta, date
+import re
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -87,55 +88,157 @@ def _entry_user_id(entry: dict[str, Any]) -> str:
     )
 
 
-def _current_timelog_task_dates(client: TeamworkClient, start: str, end: str, user_id: str) -> set[tuple[str, str]] | None:
-    """Return live (local work date, task id) pairs from Teamwork time entries."""
+def _current_timelogs(client: TeamworkClient, start: str, end: str, user_id: str) -> list[dict[str, Any]] | None:
+    """Return live Teamwork timelogs for the requested user/date range."""
     try:
         payload = client.get_time_entries(start, end, user_id)
     except Exception:
         return None
     entries = payload.get("timelogs") or payload.get("timeEntries") or []
-    pairs: set[tuple[str, str]] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if user_id and _entry_user_id(entry) and _entry_user_id(entry) != str(user_id):
-            continue
-        entry_date = _entry_date(entry)
-        task_id = _entry_task_id(entry)
-        if entry_date and task_id:
-            pairs.add((entry_date, task_id))
-    return pairs
+    return [
+        entry for entry in entries
+        if isinstance(entry, dict)
+        and (not user_id or not _entry_user_id(entry) or _entry_user_id(entry) == str(user_id))
+    ]
 
 
-def _event_local_date(event: dict[str, Any]) -> str:
-    raw = str(event.get("start_at") or event.get("start") or "")
+def _event_start_value(event: dict[str, Any]) -> str:
+    raw = event.get("start_at") or event.get("start") or ""
+    if isinstance(raw, dict):
+        raw = raw.get("dateTime") or raw.get("date") or ""
+    return str(raw)
+
+
+def _event_display_date(event: dict[str, Any]) -> str:
+    raw = _event_start_value(event)
+    return raw[:10] if raw else ""
+
+
+def _event_start_time(event: dict[str, Any]) -> str:
+    raw = _event_start_value(event)
+    return raw[11:19] if len(raw) >= 19 else ""
+
+
+def _event_duration_minutes(event: dict[str, Any]) -> int:
+    raw_minutes = event.get("duration_minutes") or event.get("minutes")
+    if raw_minutes is not None:
+        try:
+            return int(raw_minutes)
+        except Exception:
+            pass
+    start_at = _event_start_value(event)
+    raw_end = event.get("end_at") or event.get("end") or ""
+    if isinstance(raw_end, dict):
+        raw_end = raw_end.get("dateTime") or raw_end.get("date") or ""
+    try:
+        start_dt = datetime.fromisoformat(str(start_at).replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(str(raw_end).replace("Z", "+00:00"))
+        return int((end_dt - start_dt).total_seconds() / 60)
+    except Exception:
+        return 0
+
+
+def _entry_local_time(entry: dict[str, Any]) -> str:
+    raw = str(entry.get("timeLogged") or entry.get("time-logged") or "")
     if not raw:
         return ""
-    # Teamwork's calendar event payload returns dateTime with a `Z` suffix plus a
-    # separate timeZone, but the UI/app display treats the date portion as the
-    # event's work date. Do not convert it to Vancouver here or evening events
-    # around UTC midnight can be shifted to the previous day and incorrectly
-    # marked stale.
-    return raw[:10]
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.astimezone(FILLER_TIMEZONE).strftime("%H:%M:%S")
+    except Exception:
+        return ""
 
 
-def _drop_stale_mapped_task_ids(events: list[dict[str, Any]], live_task_dates: set[tuple[str, str]] | None) -> None:
-    """Teamwork calendar events can keep mappedTaskIds after the timelog is deleted.
+def _entry_raw_date(entry: dict[str, Any]) -> str:
+    raw = str(entry.get("timeLogged") or entry.get("time-logged") or "")
+    return raw[:10] if raw else ""
 
-    The Matching page treats mappedTaskIds as already logged, so reconcile them
-    against current time entries for the same local work date before returning.
+
+def _entry_raw_time(entry: dict[str, Any]) -> str:
+    raw = str(entry.get("timeLogged") or entry.get("time-logged") or "")
+    return raw[11:19] if len(raw) >= 19 else ""
+
+
+def _timelog_matches_event(entry: dict[str, Any], event: dict[str, Any], task_id: int | str) -> bool:
+    if _entry_task_id(entry) != str(task_id):
+        return False
+    return _timelog_matches_event_timebox(entry, event)
+
+
+def _plain_text(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = text.replace(":+1:", " ").replace("👍", " ").replace("✅", " ")
+    text = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _text_words(value: str) -> set[str]:
+    stop = {"event", "the", "and", "for", "with", "from", "this", "that", "work", "meeting", "call", "task", "created", "reclaim"}
+    return {word for word in _plain_text(value).split() if len(word) >= 3 and word not in stop}
+
+
+def _timelog_text_matches_event(entry: dict[str, Any], event: dict[str, Any]) -> bool:
+    title = str(event.get("title") or event.get("summary") or "")
+    description = _entry_description(entry)
+    title_text = _plain_text(title)
+    description_text = _plain_text(description)
+    if title_text and title_text in description_text:
+        return True
+    title_words = _text_words(title)
+    if not title_words:
+        return False
+    description_words = _text_words(description)
+    overlap = title_words & description_words
+    return len(overlap) >= 2 and (len(overlap) / len(title_words)) >= 0.45
+
+
+def _timelog_matches_event_timebox(entry: dict[str, Any], event: dict[str, Any]) -> bool:
+    if _event_display_date(event) not in {_entry_date(entry), _entry_raw_date(entry)}:
+        return False
+    if int(entry.get("minutes") or 0) != _event_duration_minutes(event):
+        return False
+    event_time = _event_start_time(event)
+    if event_time and event_time not in {_entry_raw_time(entry), _entry_local_time(entry)}:
+        return False
+    return True
+
+
+def _timelog_matches_event_shape(entry: dict[str, Any], event: dict[str, Any]) -> bool:
+    return _timelog_matches_event_timebox(entry, event) and _timelog_text_matches_event(entry, event)
+
+
+def _drop_stale_mapped_task_ids(events: list[dict[str, Any]], live_timelogs: list[dict[str, Any]] | None) -> None:
+    """Reconcile calendar mappedTaskIds with live timelogs.
+
+    Calendar mappedTaskIds can be stale after deletion, while recurring/event
+    edge cases can have a real timelog without mappedTaskIds. Use exact
+    event-shaped live timelogs (date, duration, start time, title/description)
+    to decide the displayed logged state.
     """
-    if live_task_dates is None:
+    if live_timelogs is None:
         return
     for event in events:
         mapped = event.get("mappedTaskIds")
-        if not isinstance(mapped, list) or not mapped:
-            continue
-        event_date = _event_local_date(event)
-        current = [task_id for task_id in mapped if (event_date, str(task_id)) in live_task_dates]
-        if len(current) != len(mapped):
-            event["staleMappedTaskIds"] = mapped
+        original_mapped = mapped if isinstance(mapped, list) else []
+        current = [task_id for task_id in original_mapped if any(_timelog_matches_event(entry, event, task_id) for entry in live_timelogs)]
+        if current:
             event["mappedTaskIds"] = current
+            continue
+
+        shaped_matches = [entry for entry in live_timelogs if _timelog_matches_event_shape(entry, event)]
+        if shaped_matches:
+            live_task_ids = []
+            for entry in shaped_matches:
+                task_id = _entry_task_id(entry)
+                if task_id and int(task_id) not in live_task_ids:
+                    live_task_ids.append(int(task_id))
+            if original_mapped:
+                event["staleMappedTaskIds"] = original_mapped
+            event["mappedTaskIds"] = live_task_ids
+            event["liveLoggedTaskIds"] = live_task_ids
+        elif original_mapped:
+            event["staleMappedTaskIds"] = original_mapped
+            event["mappedTaskIds"] = []
 
 
 def _entry_description(entry: dict[str, Any]) -> str:
@@ -343,8 +446,8 @@ def get_events(
 
     all_events = [ev for ev in all_events if not _is_excluded_matching_event(ev)]
 
-    live_task_dates = _current_timelog_task_dates(client, start, end, teamwork_settings.user_id or "")
-    _drop_stale_mapped_task_ids(all_events, live_task_dates)
+    live_timelogs = _current_timelogs(client, start, end, teamwork_settings.user_id or "")
+    _drop_stale_mapped_task_ids(all_events, live_timelogs)
 
     # Sort by start_at
     all_events.sort(key=lambda e: str(e.get("start_at", "")))
