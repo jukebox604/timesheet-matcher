@@ -90,7 +90,16 @@ class TeamworkClient:
         if user_id:
             params["userId"] = user_id
         base = f"https://{self.settings.site}/projects/api/v3/time.json"
-        return self._get(base, params)
+        data = self._get(base, params)
+        meta = data.get("meta", {}) if isinstance(data, dict) else {}
+        while ((meta.get("page") or {}).get("hasMore", False) if isinstance(meta, dict) else False):
+            params["page"] = int(params.get("page", 1)) + 1
+            next_data = self._get(base, params)
+            if not isinstance(next_data, dict) or "timelogs" not in next_data:
+                break
+            data["timelogs"] = (data.get("timelogs") or []) + (next_data.get("timelogs") or [])
+            meta = next_data.get("meta", {})
+        return data
 
     def list_calendars(self) -> list[dict[str, Any]]:
         """List calendars available to the user."""

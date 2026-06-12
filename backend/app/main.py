@@ -75,6 +75,18 @@ def _entry_task_id(entry: dict[str, Any]) -> str:
     )
 
 
+def _entry_user_id(entry: dict[str, Any]) -> str:
+    user = entry.get("user") or entry.get("person") or {}
+    return str(
+        entry.get("userId")
+        or entry.get("user-id")
+        or entry.get("personId")
+        or entry.get("person-id")
+        or user.get("id")
+        or ""
+    )
+
+
 def _current_timelog_task_dates(client: TeamworkClient, start: str, end: str, user_id: str) -> set[tuple[str, str]] | None:
     """Return live (local work date, task id) pairs from Teamwork time entries."""
     try:
@@ -85,6 +97,8 @@ def _current_timelog_task_dates(client: TeamworkClient, start: str, end: str, us
     pairs: set[tuple[str, str]] = set()
     for entry in entries:
         if not isinstance(entry, dict):
+            continue
+        if user_id and _entry_user_id(entry) and _entry_user_id(entry) != str(user_id):
             continue
         entry_date = _entry_date(entry)
         task_id = _entry_task_id(entry)
@@ -97,10 +111,12 @@ def _event_local_date(event: dict[str, Any]) -> str:
     raw = str(event.get("start_at") or event.get("start") or "")
     if not raw:
         return ""
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(FILLER_TIMEZONE).date().isoformat()
-    except Exception:
-        return raw[:10]
+    # Teamwork's calendar event payload returns dateTime with a `Z` suffix plus a
+    # separate timeZone, but the UI/app display treats the date portion as the
+    # event's work date. Do not convert it to Vancouver here or evening events
+    # around UTC midnight can be shifted to the previous day and incorrectly
+    # marked stale.
+    return raw[:10]
 
 
 def _drop_stale_mapped_task_ids(events: list[dict[str, Any]], live_task_dates: set[tuple[str, str]] | None) -> None:
