@@ -20,6 +20,7 @@ EXCLUDED_MATCHING_EVENT_TITLES = (
     "pm email review",
     "decompress",
     "personal commitment",
+    "out of office",
 )
 
 FILLER_PROJECT_ID = 417162
