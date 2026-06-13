@@ -294,27 +294,15 @@ function currentWorkWeek() {
   return { start: toDateInputValue(monday), end: toDateInputValue(friday) }
 }
 
-function toWeekInputValue(date: Date) {
-  const copy = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()))
-  const day = copy.getUTCDay() || 7
-  copy.setUTCDate(copy.getUTCDate() + 4 - day)
-  const yearStart = new Date(Date.UTC(copy.getUTCFullYear(), 0, 1))
-  const week = Math.ceil((((copy.getTime() - yearStart.getTime()) / 86400000) + 1) / 7)
-  return `${copy.getUTCFullYear()}-W${String(week).padStart(2, '0')}`
-}
-
-function workWeekFromWeekInput(value: string) {
-  const match = value.match(/^(\d{4})-W(\d{2})$/)
-  if (!match) return currentWorkWeek()
-  const year = Number(match[1])
-  const week = Number(match[2])
-  const jan4 = new Date(Date.UTC(year, 0, 4))
-  const jan4Day = jan4.getUTCDay() || 7
-  const monday = new Date(jan4)
-  monday.setUTCDate(jan4.getUTCDate() - jan4Day + 1 + (week - 1) * 7)
+function workWeekFromDateInput(value: string) {
+  const selected = value ? new Date(`${value}T12:00:00`) : new Date()
+  if (Number.isNaN(selected.getTime())) return currentWorkWeek()
+  const day = selected.getDay() || 7
+  const monday = new Date(selected)
+  monday.setDate(selected.getDate() - day + 1)
   const friday = new Date(monday)
-  friday.setUTCDate(monday.getUTCDate() + 4)
-  return { start: monday.toISOString().slice(0, 10), end: friday.toISOString().slice(0, 10) }
+  friday.setDate(monday.getDate() + 4)
+  return { start: toDateInputValue(monday), end: toDateInputValue(friday) }
 }
 
 function normalizeText(value?: string) {
@@ -525,7 +513,7 @@ export default function Events() {
   const [runningFiller, setRunningFiller] = useState(false)
   const runningFillerRef = useRef(false)
   const autoLoadedRef = useRef(false)
-  const selectedWeek = useMemo(() => toWeekInputValue(new Date(`${start}T12:00:00`)), [start])
+  const selectedWeekMonday = start
 
   const loadTasksForProject = useCallback(async (projectId: number): Promise<TeamworkTask[]> => {
     if (tasks[projectId]) return tasks[projectId]
@@ -617,7 +605,7 @@ export default function Events() {
   }, [handleLoad])
 
   const handleWeekChange = (value: string) => {
-    const range = workWeekFromWeekInput(value)
+    const range = workWeekFromDateInput(value)
     setStart(range.start)
     setEnd(range.end)
   }
@@ -783,9 +771,9 @@ export default function Events() {
 
       <div className="controls-row matching-controls">
         <div className="field-group week-field">
-          <label>Week</label>
-          <input type="week" value={selectedWeek} onChange={e => handleWeekChange(e.target.value)} />
-          <span className="week-range-hint">{formatDate(start)} to {formatDate(end)}</span>
+          <label>Week of Monday</label>
+          <input type="date" value={selectedWeekMonday} onChange={e => handleWeekChange(e.target.value)} />
+          <span className="week-range-hint">Mon–Fri: {formatDate(start)} to {formatDate(end)}</span>
         </div>
         <button className="btn btn-primary load-events-btn" onClick={handleLoad} disabled={loading}>
           {loading ? 'Loading…' : 'Load Events'}
