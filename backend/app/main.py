@@ -1,4 +1,5 @@
 from datetime import datetime, timezone, timedelta, date
+import html
 import re
 from pathlib import Path
 from threading import Lock
@@ -23,6 +24,10 @@ EXCLUDED_MATCHING_EVENT_TITLES = (
     "out of office",
 )
 PERSONAL_COMMITMENT_TITLE = "personal commitment"
+RECLAIM_DESCRIPTION_BOILERPLATE = (
+    "This event was created by Reclaim.",
+    "Only you can see this Task's event details. It will show as busy to others and automatically reschedule if booked over.",
+)
 
 FILLER_PROJECT_ID = 417162
 FILLER_TASK_ID = 29936460
@@ -44,6 +49,29 @@ def _is_excluded_matching_event(event: dict[str, Any]) -> bool:
 def _is_personal_commitment_event(event: dict[str, Any]) -> bool:
     title = str(event.get("title") or event.get("summary") or "").lower()
     return PERSONAL_COMMITMENT_TITLE in title
+
+
+def _clean_event_description(description: str | None) -> str:
+    text = str(description or "")
+    if not text:
+        return ""
+    # Remove Reclaim boilerplate before and after tag stripping; the word "Reclaim"
+    # is often wrapped in a link, so exact plain-text matching only works after cleanup.
+    text = re.sub(r"(?is)<i>\s*This event was created by\s*<a\b[^>]*>\s*Reclaim\s*</a>\s*\.\s*</i>", " ", text)
+    text = re.sub(r"(?is)Only you can see this Task's event details\.\s*It will show as busy to others and automatically reschedule if booked over\.", " ", text)
+    # Preserve meaningful structure before stripping HTML from Teamwork/Google/Reclaim descriptions.
+    text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", text)
+    text = re.sub(r"(?i)</\s*(p|div|li|tr|h[1-6])\s*>", "\n", text)
+    text = re.sub(r"(?i)<\s*li\b[^>]*>", "\n• ", text)
+    text = re.sub(r"(?i)<\s*/?\s*(ul|ol|table|tbody|thead)\b[^>]*>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    for boilerplate in RECLAIM_DESCRIPTION_BOILERPLATE:
+        text = text.replace(boilerplate, " ")
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _event_datetime_value(event: dict[str, Any], key: str) -> str:
@@ -552,6 +580,7 @@ def get_events(
                 ev["calendarId"] = cal_id
                 # Normalize field names
                 ev["title"] = ev.get("summary", ev.get("title", ""))
+                ev["description"] = _clean_event_description(ev.get("description"))
                 ev_start = ev.get("start", {})
                 ev_end = ev.get("end", {})
                 if isinstance(ev_start, dict):

@@ -328,7 +328,21 @@ function eventText(ev: EventItem) {
 
 function cleanDescription(description?: string) {
   if (!description) return 'No description provided.'
-  return description.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || 'No description provided.'
+  return description
+    .replace(/<\s*br\s*\/?\s*>/gi, '\n')
+    .replace(/<\s*\/\s*(p|div|li|tr|h[1-6])\s*>/gi, '\n')
+    .replace(/<\s*li\b[^>]*>/gi, '\n• ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/This event was created by Reclaim\./gi, ' ')
+    .replace(/Only you can see this Task's event details\. It will show as busy to others and automatically reschedule if booked over\./gi, ' ')
+    .replace(/[ \t\r\f\v]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim() || 'No description provided.'
 }
 
 function keywordHits(text: string, keywords: string[] = []) {
