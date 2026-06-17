@@ -549,7 +549,8 @@ body {
   gap: 8px;
 }
 
-.desk-ticket-box select {
+.desk-ticket-box select,
+.desk-ticket-box input {
   padding: 9px 12px;
   background: var(--bg-input);
   border: 1px solid var(--border);
@@ -560,8 +561,19 @@ body {
   width: 100%;
 }
 
-.desk-ticket-box select:focus {
+.desk-ticket-box select:focus,
+.desk-ticket-box input:focus {
   border-color: var(--warning);
+}
+
+.desk-ticket-box input::placeholder {
+  color: var(--text-muted);
+}
+
+.desk-ticket-box select:disabled,
+.desk-ticket-box input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .desk-ticket-box select option {

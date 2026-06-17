@@ -612,11 +612,13 @@ export default function Events() {
   const [matches, setMatches] = useState<Record<string, MatchEntry>>({})
   const [confirmedMatches, setConfirmedMatches] = useState<Record<string, MatchEntry>>({})
   const [taskSearches, setTaskSearches] = useState<Record<string, string>>({})
+  const [deskTicketSearches, setDeskTicketSearches] = useState<Record<string, string>>({})
   const [projects, setProjects] = useState<TeamworkProject[]>([])
   const [tasks, setTasks] = useState<Record<number, TeamworkTask[]>>({})
   const [deskTickets, setDeskTickets] = useState<DeskTicket[]>([])
   const [selectedDeskTickets, setSelectedDeskTickets] = useState<Record<string, DeskTicket>>({})
   const [loadingTasks, setLoadingTasks] = useState<Record<number, boolean>>({})
+  const [loadingDeskTickets, setLoadingDeskTickets] = useState<Record<number, boolean>>({})
   const [error, setError] = useState('')
   const [actionStatus, setActionStatus] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -640,6 +642,42 @@ export default function Events() {
       setLoadingTasks(prev => ({ ...prev, [projectId]: false }))
     }
   }, [loadingTasks, tasks])
+
+  const mergeDeskTickets = useCallback((ticketList: DeskTicket[]) => {
+    if (!ticketList.length) return
+    setDeskTickets(prev => {
+      const byId = new Map(prev.map(ticket => [ticket.id, ticket]))
+      for (const ticket of ticketList) {
+        const existing = byId.get(ticket.id)
+        byId.set(ticket.id, {
+          ...existing,
+          ...ticket,
+          projectIds: Array.from(new Set([...(existing?.projectIds || []), ...(ticket.projectIds || [])])),
+        })
+      }
+      return Array.from(byId.values())
+    })
+  }, [])
+
+  const loadDeskTicketsForProject = useCallback(async (projectId: number, query = ''): Promise<DeskTicket[]> => {
+    setLoadingDeskTickets(prev => ({ ...prev, [projectId]: true }))
+    try {
+      const trimmed = query.trim()
+      const ticketList = /^\d{4,}$/.test(trimmed)
+        ? await fetchDeskTickets({ ticketId: Number(trimmed), limit: 1 })
+        : await fetchDeskTickets({ projectId, query: trimmed, limit: 30 })
+      const projectTickets = ticketList.map(ticket => ({
+        ...ticket,
+        projectIds: Array.from(new Set([...(ticket.projectIds || []), projectId])),
+      }))
+      mergeDeskTickets(projectTickets)
+      return projectTickets
+    } catch {
+      return []
+    } finally {
+      setLoadingDeskTickets(prev => ({ ...prev, [projectId]: false }))
+    }
+  }, [mergeDeskTickets])
 
   useEffect(() => {
     fetchProjects()
@@ -676,7 +714,10 @@ export default function Events() {
         Array.from(suggestedProjectIds).map(async projectId => [projectId, await loadTasksForProject(projectId)] as const)
       )
       const loadedTaskMap = Object.fromEntries(loadedTaskEntries) as Record<number, TeamworkTask[]>
-      const loadedDeskTickets = await fetchDeskTickets({ projectId: 914508, limit: 30 }).catch(() => [])
+      const loadedDeskTicketEntries = await Promise.all(
+        Array.from(suggestedProjectIds).map(async projectId => await loadDeskTicketsForProject(projectId))
+      )
+      const loadedDeskTickets = loadedDeskTicketEntries.flat()
 
       for (const ev of loadedEvents) {
         const baseSuggestion = baseSuggestions[ev.id]
@@ -704,12 +745,13 @@ export default function Events() {
       setConfirmedMatches({})
       setSelectedDeskTickets({})
       setTaskSearches({})
+      setDeskTicketSearches({})
     } catch (e) {
       setError((e as Error).message)
     } finally {
       setLoading(false)
     }
-  }, [end, loadTasksForProject, start])
+  }, [end, loadDeskTicketsForProject, loadTasksForProject, start])
 
   useEffect(() => {
     if (autoLoadedRef.current) return
@@ -733,8 +775,19 @@ export default function Events() {
       delete next[eventId]
       return next
     })
+    setSelectedDeskTickets(prev => {
+      const next = { ...prev }
+      delete next[eventId]
+      return next
+    })
     setTaskSearches(prev => ({ ...prev, [eventId]: '' }))
-    if (projectId) await loadTasksForProject(projectId)
+    setDeskTicketSearches(prev => ({ ...prev, [eventId]: '' }))
+    if (projectId) {
+      await Promise.all([
+        loadTasksForProject(projectId),
+        loadDeskTicketsForProject(projectId),
+      ])
+    }
   }
 
   const handleSelectTask = (eventId: string, taskId: number | null) => {
@@ -794,8 +847,17 @@ export default function Events() {
         const existing = prev[eventId] || { eventId, projectId: null, taskId: null }
         return { ...prev, [eventId]: { ...existing, projectId: linkedProjectId, taskId: existing.projectId === linkedProjectId ? existing.taskId : null } }
       })
-      await loadTasksForProject(linkedProjectId)
+      await Promise.all([
+        loadTasksForProject(linkedProjectId),
+        loadDeskTicketsForProject(linkedProjectId),
+      ])
     }
+  }
+
+  const handleDeskTicketSearch = async (eventId: string, projectId: number | null | undefined, value: string) => {
+    setDeskTicketSearches(prev => ({ ...prev, [eventId]: value }))
+    if (!projectId) return
+    await loadDeskTicketsForProject(projectId, value)
   }
 
   const handleSubmitMatched = async () => {
@@ -917,6 +979,19 @@ export default function Events() {
     })
   }
 
+  const deskTicketsForProject = (projectId?: number | null, search = '') => {
+    const query = normalizeText(search)
+    const terms = query.split(/\s+/).filter(Boolean)
+    return deskTickets
+      .filter(ticket => !projectId || ticket.projectIds?.includes(projectId))
+      .filter(ticket => {
+        if (!terms.length) return true
+        const haystack = deskTicketText(ticket)
+        return terms.every(term => haystack.includes(term))
+      })
+      .sort((a, b) => String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || '')))
+  }
+
   return (
     <div className="card matching-card">
       <h1 className="card-header">Matching</h1>
@@ -1025,8 +1100,14 @@ export default function Events() {
           const matched = isMatched(ev)
           const selectedProjectName = projectName(selectedProject)
           const selectedTaskName = taskName(selectedProject, selectedTask)
-          const deskMatches = relatedDeskTickets(ev, deskTickets)
+          const deskTicketSearch = deskTicketSearches[ev.id] || ''
+          const projectDeskTickets = deskTicketsForProject(selectedProject, deskTicketSearch)
+          const deskMatches = selectedProject ? projectDeskTickets : relatedDeskTickets(ev, deskTickets).map(({ ticket }) => ticket)
           const selectedDeskTicket = selectedDeskTickets[ev.id]
+          const deskTicketOptions = selectedDeskTicket && !deskMatches.some(ticket => ticket.id === selectedDeskTicket.id)
+            ? [selectedDeskTicket, ...deskMatches]
+            : deskMatches
+          const isDeskTicketsLoading = selectedProject ? loadingDeskTickets[selectedProject] : false
 
           return (
             <div key={ev.id} className={`event-card ${matched ? 'event-card-matched' : ''}`}>
@@ -1057,28 +1138,35 @@ export default function Events() {
                     </div>
                   )}
                 </div>
-                {(deskMatches.length > 0 || selectedDeskTicket) && (
+                {(selectedProject || deskTicketOptions.length > 0 || selectedDeskTicket) && (
                   <div className="desk-ticket-box">
                     <span className="suggestion-label">Related Desk ticket</span>
+                    <input
+                      type="search"
+                      value={deskTicketSearch}
+                      placeholder={selectedProject ? 'Search Desk tickets by ID or subject…' : 'Select a project to search Desk tickets…'}
+                      disabled={!selectedProject || isDeskTicketsLoading}
+                      onChange={e => void handleDeskTicketSearch(ev.id, selectedProject, e.target.value)}
+                    />
                     <select
                       value={selectedDeskTicket?.id ?? ''}
+                      disabled={!selectedProject && deskTicketOptions.length === 0}
                       onChange={e => {
                         const ticket = deskTickets.find(item => item.id === Number(e.target.value)) || null
                         void handleSelectDeskTicket(ev.id, ticket)
                       }}
                     >
-                      <option value="">— Select Desk ticket —</option>
-                      {selectedDeskTicket && !deskMatches.some(({ ticket }) => ticket.id === selectedDeskTicket.id) && (
-                        <option value={selectedDeskTicket.id}>{deskTicketLabel(selectedDeskTicket)}</option>
-                      )}
-                      {deskMatches.map(({ ticket, score }) => (
-                        <option key={ticket.id} value={ticket.id}>{deskTicketLabel(ticket)} · score {score}</option>
+                      <option value="">{isDeskTicketsLoading ? 'Loading Desk tickets…' : deskTicketSearch ? `— ${deskTicketOptions.length} matching Desk tickets —` : '— Select Desk ticket —'}</option>
+                      {deskTicketOptions.map(ticket => (
+                        <option key={ticket.id} value={ticket.id}>{deskTicketLabel(ticket)}</option>
                       ))}
                     </select>
                     {selectedDeskTicket ? (
                       <small className="desk-ticket-detail">
                         {selectedDeskTicket.companyName || 'Desk'} · {selectedDeskTicket.status || 'status unknown'} · time description will include Desk #{selectedDeskTicket.id}
                       </small>
+                    ) : selectedProject ? (
+                      <small className="desk-ticket-detail">Search/select a Desk ticket to pair it with this project/task match.</small>
                     ) : (
                       <small className="desk-ticket-detail">Desk candidates are matched by customer/domain, event text, and ticket subject.</small>
                     )}
