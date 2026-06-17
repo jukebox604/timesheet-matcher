@@ -208,6 +208,26 @@ class TeamworkClient:
         # Filter to active, non-archived
         return [p for p in projects if not p.get("archived", False)]
 
+    def get_project(self, project_id: int | str) -> dict[str, Any]:
+        """Fetch a project with company details.
+
+        The v1 project endpoint includes the company name, which is useful when
+        mapping Teamwork Desk companies to Teamwork Projects companies. Desk and
+        Projects company IDs are different namespaces, so do not match on ID.
+        """
+        base = f"https://{self.settings.site}/projects/{project_id}.json"
+        data = self._get(base, {})
+        return data.get("project", {})
+
+    def get_desk_ticket(self, ticket_id: int | str) -> dict[str, Any]:
+        base = f"https://{self.settings.site}/desk/v1/tickets/{ticket_id}.json"
+        data = self._get(base, {})
+        return data.get("ticket", {})
+
+    def list_desk_tickets(self, company_id: int | str, page: int = 1, page_size: int = 100) -> dict[str, Any]:
+        base = f"https://{self.settings.site}/desk/v1/tickets.json"
+        return self._get(base, {"companyId": company_id, "page": page, "pageSize": page_size})
+
     def list_tasks(self, project_id: int | str) -> list[dict[str, Any]]:
         """List tasks for a project."""
         base = f"https://{self.settings.site}/projects/api/v3/projects/{project_id}/tasks.json"

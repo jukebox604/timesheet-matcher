@@ -539,6 +539,41 @@ body {
   color: var(--text-muted);
 }
 
+.desk-ticket-box {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(250, 204, 21, 0.18);
+  border-radius: 12px;
+  background: rgba(250, 204, 21, 0.055);
+  display: grid;
+  gap: 8px;
+}
+
+.desk-ticket-box select {
+  padding: 9px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 14px;
+  outline: none;
+  width: 100%;
+}
+
+.desk-ticket-box select:focus {
+  border-color: var(--warning);
+}
+
+.desk-ticket-box select option {
+  background: var(--bg-card);
+  color: var(--text-primary);
+}
+
+.desk-ticket-detail {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .event-actions {
   display: grid;
   grid-template-columns: minmax(220px, 1fr) minmax(260px, 1.25fr) auto auto;

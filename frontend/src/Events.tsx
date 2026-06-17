@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, runTimesheetFiller, type EventItem, type TeamworkProject, type TeamworkTask } from './timesheet'
+import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, runTimesheetFiller, fetchDeskTickets, type EventItem, type TeamworkProject, type TeamworkTask, type DeskTicket } from './timesheet'
 
 interface MatchEntry {
   eventId: string
@@ -363,8 +363,13 @@ function eventDetailText(ev: EventItem) {
   return normalizeText([ev.description, ev._calendar_name].filter(Boolean).join(' '))
 }
 
+function attendeeText(ev: EventItem) {
+  const attendees = Array.isArray(ev.attendees) ? ev.attendees : []
+  return normalizeText(JSON.stringify(attendees))
+}
+
 function eventText(ev: EventItem) {
-  return normalizeText([ev.title, ev.description, ev.type, ev._calendar_name].filter(Boolean).join(' '))
+  return normalizeText([ev.title, ev.description, ev.type, ev._calendar_name, attendeeText(ev)].filter(Boolean).join(' '))
 }
 
 function cleanDescription(description?: string) {
@@ -545,6 +550,53 @@ function hasMappedTask(ev: EventItem) {
   return Array.isArray(maybe.mappedTaskIds) && maybe.mappedTaskIds.length > 0
 }
 
+function deskTicketText(ticket: DeskTicket) {
+  return normalizeText([
+    ticket.id,
+    ticket.subject,
+    ticket.preview,
+    ticket.companyName,
+    ticket.customerName,
+    ticket.customerEmail,
+    ticket.status,
+    ticket.type,
+  ].filter(Boolean).join(' '))
+}
+
+function deskTicketScore(ev: EventItem, ticket: DeskTicket) {
+  const evText = eventText(ev)
+  const titleText = eventTitleText(ev)
+  const ticketText = deskTicketText(ticket)
+  const subjectWords = meaningfulWords(ticket.subject || '')
+  const matchedSubjectWords = subjectWords.filter(word => evText.includes(word))
+  let score = matchedSubjectWords.length * 25
+  if (ticket.companyName && evText.includes(normalizeText(ticket.companyName))) score += 55
+  const emailDomain = normalizeText((ticket.customerEmail || '').split('@')[1] || '')
+  if (emailDomain && evText.includes(emailDomain)) score += 60
+  if (ticketText && titleText && ticketText.includes(titleText)) score += 80
+  if (normalizeText(ticket.subject).includes(titleText) && titleText.length > 5) score += 80
+  if ((ticket.status || '').toLowerCase().includes('progress')) score += 10
+  return score
+}
+
+function relatedDeskTickets(ev: EventItem, tickets: DeskTicket[]) {
+  return tickets
+    .map(ticket => ({ ticket, score: deskTicketScore(ev, ticket) }))
+    .filter(result => result.score >= 50)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5)
+}
+
+function deskTicketLabel(ticket: DeskTicket) {
+  return `#${ticket.id} — ${ticket.subject}`
+}
+
+function descriptionWithDeskTicket(ev: EventItem, ticket?: DeskTicket) {
+  const base = ev.description || `Event: ${ev.title || ''}`
+  if (!ticket) return base
+  return `Desk #${ticket.id} — ${ticket.subject}\n\n${base}`
+}
+
 export default function Events() {
   const defaults = useMemo(() => currentWorkWeek(), [])
   const [start, setStart] = useState(defaults.start)
@@ -562,6 +614,8 @@ export default function Events() {
   const [taskSearches, setTaskSearches] = useState<Record<string, string>>({})
   const [projects, setProjects] = useState<TeamworkProject[]>([])
   const [tasks, setTasks] = useState<Record<number, TeamworkTask[]>>({})
+  const [deskTickets, setDeskTickets] = useState<DeskTicket[]>([])
+  const [selectedDeskTickets, setSelectedDeskTickets] = useState<Record<string, DeskTicket>>({})
   const [loadingTasks, setLoadingTasks] = useState<Record<number, boolean>>({})
   const [error, setError] = useState('')
   const [actionStatus, setActionStatus] = useState('')
@@ -622,6 +676,7 @@ export default function Events() {
         Array.from(suggestedProjectIds).map(async projectId => [projectId, await loadTasksForProject(projectId)] as const)
       )
       const loadedTaskMap = Object.fromEntries(loadedTaskEntries) as Record<number, TeamworkTask[]>
+      const loadedDeskTickets = await fetchDeskTickets({ projectId: 914508, limit: 30 }).catch(() => [])
 
       for (const ev of loadedEvents) {
         const baseSuggestion = baseSuggestions[ev.id]
@@ -644,8 +699,10 @@ export default function Events() {
       setWeeklyLoggedMinutes(loadedCreditedMinutes)
       setWeeklyUnavailableMinutes(loadedUnavailableMinutes)
       setWeeklyPersonalCommitmentMinutes(loadedPersonalCommitmentMinutes)
+      setDeskTickets(loadedDeskTickets)
       setMatches(initialMatches)
       setConfirmedMatches({})
+      setSelectedDeskTickets({})
       setTaskSearches({})
     } catch (e) {
       setError((e as Error).message)
@@ -714,23 +771,53 @@ export default function Events() {
       delete next[eventId]
       return next
     })
+    setSelectedDeskTickets(prev => {
+      const next = { ...prev }
+      delete next[eventId]
+      return next
+    })
+  }
+
+  const handleSelectDeskTicket = async (eventId: string, ticket: DeskTicket | null) => {
+    if (!ticket) {
+      setSelectedDeskTickets(prev => {
+        const next = { ...prev }
+        delete next[eventId]
+        return next
+      })
+      return
+    }
+    setSelectedDeskTickets(prev => ({ ...prev, [eventId]: ticket }))
+    const linkedProjectId = ticket.projectIds?.[0]
+    if (linkedProjectId) {
+      setMatches(prev => {
+        const existing = prev[eventId] || { eventId, projectId: null, taskId: null }
+        return { ...prev, [eventId]: { ...existing, projectId: linkedProjectId, taskId: existing.projectId === linkedProjectId ? existing.taskId : null } }
+      })
+      await loadTasksForProject(linkedProjectId)
+    }
   }
 
   const handleSubmitMatched = async () => {
     const entries = events
       .map(ev => ({ ev, match: confirmedMatches[ev.id] }))
       .filter(({ ev, match }) => match?.projectId && match?.taskId && !hasMappedTask(ev))
-      .map(({ ev, match }) => ({
-        eventId: ev.id,
-        calendarId: ev.calendarId || 1306,
-        title: ev.title,
-        description: ev.description,
-        start: ev.start,
-        duration_minutes: ev.duration_minutes,
-        projectId: Number(match!.projectId),
-        taskId: Number(match!.taskId),
-        mappedTaskIds: ev.mappedTaskIds,
-      }))
+      .map(({ ev, match }) => {
+        const deskTicket = selectedDeskTickets[ev.id]
+        return {
+          eventId: ev.id,
+          calendarId: ev.calendarId || 1306,
+          title: ev.title,
+          description: descriptionWithDeskTicket(ev, deskTicket),
+          start: ev.start,
+          duration_minutes: ev.duration_minutes,
+          projectId: Number(match!.projectId),
+          taskId: Number(match!.taskId),
+          mappedTaskIds: ev.mappedTaskIds,
+          deskTicketId: deskTicket?.id,
+          deskTicketSubject: deskTicket?.subject,
+        }
+      })
     if (entries.length === 0) {
       setActionStatus('No newly matched entries to submit. Click Match on entries first.')
       return
@@ -938,6 +1025,8 @@ export default function Events() {
           const matched = isMatched(ev)
           const selectedProjectName = projectName(selectedProject)
           const selectedTaskName = taskName(selectedProject, selectedTask)
+          const deskMatches = relatedDeskTickets(ev, deskTickets)
+          const selectedDeskTicket = selectedDeskTickets[ev.id]
 
           return (
             <div key={ev.id} className={`event-card ${matched ? 'event-card-matched' : ''}`}>
@@ -968,6 +1057,33 @@ export default function Events() {
                     </div>
                   )}
                 </div>
+                {(deskMatches.length > 0 || selectedDeskTicket) && (
+                  <div className="desk-ticket-box">
+                    <span className="suggestion-label">Related Desk ticket</span>
+                    <select
+                      value={selectedDeskTicket?.id ?? ''}
+                      onChange={e => {
+                        const ticket = deskTickets.find(item => item.id === Number(e.target.value)) || null
+                        void handleSelectDeskTicket(ev.id, ticket)
+                      }}
+                    >
+                      <option value="">— Select Desk ticket —</option>
+                      {selectedDeskTicket && !deskMatches.some(({ ticket }) => ticket.id === selectedDeskTicket.id) && (
+                        <option value={selectedDeskTicket.id}>{deskTicketLabel(selectedDeskTicket)}</option>
+                      )}
+                      {deskMatches.map(({ ticket, score }) => (
+                        <option key={ticket.id} value={ticket.id}>{deskTicketLabel(ticket)} · score {score}</option>
+                      ))}
+                    </select>
+                    {selectedDeskTicket ? (
+                      <small className="desk-ticket-detail">
+                        {selectedDeskTicket.companyName || 'Desk'} · {selectedDeskTicket.status || 'status unknown'} · time description will include Desk #{selectedDeskTicket.id}
+                      </small>
+                    ) : (
+                      <small className="desk-ticket-detail">Desk candidates are matched by customer/domain, event text, and ticket subject.</small>
+                    )}
+                  </div>
+                )}
               </div>
               <div className="event-actions">
                 <select

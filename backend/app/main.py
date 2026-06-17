@@ -40,6 +40,13 @@ FILLER_TIMEZONE = ZoneInfo("America/Vancouver")
 FILLER_LOCKS: dict[str, Lock] = {}
 FILLER_LOCKS_GUARD = Lock()
 
+# Desk and Projects company IDs live in different Teamwork namespaces. Keep this
+# as an explicit bridge table and prefer linked project IDs from Desk threads when
+# available. Extend as we confirm more customers.
+DESK_COMPANY_ID_BY_PROJECT_COMPANY_NAME = {
+    "wencor": 29740,
+}
+
 
 def _is_excluded_matching_event(event: dict[str, Any]) -> bool:
     title = str(event.get("title") or event.get("summary") or "").lower()
@@ -639,6 +646,133 @@ def get_events(
         "count": len(all_events),
         "events": all_events,
     }
+
+
+def _company_name_key(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _desk_company_id_for_project(project: dict[str, Any]) -> int | None:
+    company = project.get("company") or {}
+    company_name = ""
+    if isinstance(company, dict):
+        company_name = str(company.get("name") or "")
+    for name, desk_company_id in DESK_COMPANY_ID_BY_PROJECT_COMPANY_NAME.items():
+        if name in _company_name_key(company_name) or name in _company_name_key(project.get("name")):
+            return desk_company_id
+    return None
+
+
+def _project_ids_from_desk_ticket(ticket: dict[str, Any]) -> list[int]:
+    project_ids: list[int] = []
+    for thread in ticket.get("threads") or []:
+        raw_id = thread.get("taskId")
+        if raw_id is None:
+            continue
+        try:
+            project_id = int(raw_id)
+        except Exception:
+            continue
+        if project_id and project_id not in project_ids:
+            project_ids.append(project_id)
+    return project_ids
+
+
+def _desk_ticket_company(ticket: dict[str, Any]) -> dict[str, Any]:
+    company = ticket.get("company")
+    if isinstance(company, dict) and company.get("name"):
+        return company
+    customer = ticket.get("customer") or {}
+    nested = ((customer.get("company") or {}).get("company") or {}) if isinstance(customer, dict) else {}
+    return nested if isinstance(nested, dict) else {}
+
+
+def _normalize_desk_ticket(ticket: dict[str, Any], project_ids: list[int] | None = None) -> dict[str, Any]:
+    company = _desk_ticket_company(ticket)
+    customer = ticket.get("customer") or {}
+    assigned = ticket.get("assignedTo") or {}
+    inferred_project_ids = project_ids if project_ids is not None else _project_ids_from_desk_ticket(ticket)
+    return {
+        "id": ticket.get("id"),
+        "subject": ticket.get("subject") or "",
+        "preview": ticket.get("preview") or "",
+        "status": ticket.get("status") or "",
+        "state": ticket.get("state") or "",
+        "priority": ticket.get("priority") or "",
+        "type": ticket.get("type") or "",
+        "source": ticket.get("source") or "",
+        "createdAt": ticket.get("createdAt") or "",
+        "updatedAt": ticket.get("updatedAt") or "",
+        "companyName": company.get("name") or "",
+        "deskCompanyId": company.get("id"),
+        "customerName": " ".join(part for part in [customer.get("firstName"), customer.get("lastName")] if part),
+        "customerEmail": customer.get("email") or "",
+        "assignedToName": " ".join(part for part in [assigned.get("firstName"), assigned.get("lastName")] if part),
+        "assignedToEmail": assigned.get("email") or "",
+        "projectIds": inferred_project_ids,
+    }
+
+
+def _desk_ticket_search_text(ticket: dict[str, Any]) -> str:
+    normalized = _normalize_desk_ticket(ticket)
+    return _company_name_key(" ".join(str(normalized.get(key) or "") for key in [
+        "id", "subject", "preview", "status", "priority", "type", "companyName", "customerName", "customerEmail", "assignedToEmail",
+    ]))
+
+
+@app.get("/api/teamwork/desk-tickets")
+def list_desk_tickets(
+    projectId: int | None = Query(None),
+    ticketId: int | None = Query(None),
+    query: str = Query(""),
+    limit: int = Query(15, ge=1, le=50),
+) -> dict[str, object]:
+    teamwork_settings = get_teamwork_settings()
+    if not teamwork_settings.has_credentials:
+        raise HTTPException(status_code=503, detail="Teamwork is not configured")
+    client = TeamworkClient(settings=teamwork_settings)
+
+    if ticketId:
+        try:
+            ticket = client.get_desk_ticket(ticketId)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch Desk ticket {ticketId}: {exc}")
+        if not ticket:
+            return {"tickets": [], "count": 0}
+        return {"tickets": [_normalize_desk_ticket(ticket)], "count": 1}
+
+    if not projectId:
+        raise HTTPException(status_code=400, detail="projectId or ticketId is required")
+
+    try:
+        project = client.get_project(projectId)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Teamwork project {projectId}: {exc}")
+    desk_company_id = _desk_company_id_for_project(project)
+    if not desk_company_id:
+        return {"tickets": [], "count": 0, "projectId": projectId, "message": "No Desk company mapping for this project yet."}
+
+    try:
+        first_page = client.list_desk_tickets(desk_company_id, page=1, page_size=100)
+        max_pages = int(first_page.get("maxPages") or 1)
+        pages = sorted(set([max_pages, max(1, max_pages - 1), max(1, max_pages - 2)]))
+        raw_tickets: list[dict[str, Any]] = []
+        for page in pages:
+            payload = first_page if page == 1 else client.list_desk_tickets(desk_company_id, page=page, page_size=100)
+            raw_tickets.extend([ticket for ticket in payload.get("tickets") or [] if isinstance(ticket, dict)])
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Teamwork Desk tickets: {exc}")
+
+    terms = [term for term in _company_name_key(query).split() if len(term) >= 2]
+    if terms:
+        raw_tickets = [ticket for ticket in raw_tickets if all(term in _desk_ticket_search_text(ticket) for term in terms)]
+
+    def sort_key(ticket: dict[str, Any]) -> str:
+        return str(ticket.get("updatedAt") or ticket.get("createdAt") or "")
+
+    raw_tickets = sorted(raw_tickets, key=sort_key, reverse=True)[:limit]
+    normalized = [_normalize_desk_ticket(ticket, project_ids=sorted(set([projectId, *_project_ids_from_desk_ticket(ticket)]))) for ticket in raw_tickets]
+    return {"tickets": normalized, "count": len(normalized), "projectId": projectId, "deskCompanyId": desk_company_id}
 
 
 @app.get("/api/teamwork/projects")

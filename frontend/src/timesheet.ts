@@ -9,6 +9,27 @@ export interface EventItem {
   calendarId?: number
   type?: string
   mappedTaskIds?: number[] | null
+  attendees?: unknown[]
+}
+
+export interface DeskTicket {
+  id: number
+  subject: string
+  preview?: string
+  status?: string
+  state?: string
+  priority?: string
+  type?: string
+  source?: string
+  createdAt?: string
+  updatedAt?: string
+  companyName?: string
+  deskCompanyId?: number
+  customerName?: string
+  customerEmail?: string
+  assignedToName?: string
+  assignedToEmail?: string
+  projectIds?: number[]
 }
 
 export interface TeamworkProject {
@@ -73,6 +94,16 @@ export async function fetchTasks(projectId: number): Promise<TeamworkTask[]> {
   return data.tasks || []
 }
 
+export async function fetchDeskTickets(params: { projectId?: number; ticketId?: number; query?: string; limit?: number }): Promise<DeskTicket[]> {
+  const query = new URLSearchParams()
+  if (params.projectId) query.set('projectId', String(params.projectId))
+  if (params.ticketId) query.set('ticketId', String(params.ticketId))
+  if (params.query) query.set('query', params.query)
+  if (params.limit) query.set('limit', String(params.limit))
+  const data = await get<{ tickets: DeskTicket[] }>(`/api/teamwork/desk-tickets?${query.toString()}`)
+  return data.tickets || []
+}
+
 export interface SubmitMatchedEntry {
   eventId: string
   calendarId?: number
@@ -85,6 +116,8 @@ export interface SubmitMatchedEntry {
   projectId: number
   taskId: number
   mappedTaskIds?: number[] | null
+  deskTicketId?: number
+  deskTicketSubject?: string
 }
 
 export async function submitMatchedEntries(entries: SubmitMatchedEntry[]): Promise<{ status: string; created: unknown[]; skipped: unknown[]; errors: unknown[] }> {
