@@ -361,6 +361,66 @@ body {
   color: var(--text-primary);
 }
 
+.day-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -4px 0 16px;
+  padding: 6px;
+  width: fit-content;
+  max-width: 100%;
+  background: rgba(15, 17, 23, 0.34);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.day-filter-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.day-filter-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.day-filter-btn small {
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.day-filter-btn-active {
+  color: #fff;
+  background: var(--accent);
+  border-color: rgba(255, 255, 255, 0.12);
+  box-shadow: 0 8px 22px rgba(129, 140, 248, 0.2);
+}
+
+.day-filter-btn-active:hover {
+  background: var(--accent-hover);
+}
+
+.day-filter-btn-active small {
+  color: #fff;
+  background: rgba(15, 17, 23, 0.22);
+}
+
 /* Event list */
 .event-list {
   display: flex;
@@ -742,7 +802,15 @@ body {
   }
   .field-group input,
   .field-group select,
-  .load-events-btn {
+  .load-events-btn,
+  .day-filter-bar {
     width: 100%;
+  }
+  .day-filter-bar {
+    border-radius: 14px;
+  }
+  .day-filter-btn {
+    flex: 1 1 72px;
+    justify-content: center;
   }
 }

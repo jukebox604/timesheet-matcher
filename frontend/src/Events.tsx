@@ -18,6 +18,27 @@ interface SuggestedMatch {
 
 const WORK_WEEK_TARGET_MINUTES = 40 * 60
 
+type DayFilter = 'all' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri'
+
+const DAY_FILTERS: Array<{ value: DayFilter; label: string; longLabel: string }> = [
+  { value: 'all', label: 'All', longLabel: 'All weekdays' },
+  { value: 'mon', label: 'Mon', longLabel: 'Monday' },
+  { value: 'tue', label: 'Tue', longLabel: 'Tuesday' },
+  { value: 'wed', label: 'Wed', longLabel: 'Wednesday' },
+  { value: 'thu', label: 'Thu', longLabel: 'Thursday' },
+  { value: 'fri', label: 'Fri', longLabel: 'Friday' },
+]
+
+const DAY_INDEX_TO_FILTER: Record<number, DayFilter | null> = {
+  0: null,
+  1: 'mon',
+  2: 'tue',
+  3: 'wed',
+  4: 'thu',
+  5: 'fri',
+  6: null,
+}
+
 interface MatchRule extends SuggestedMatch {
   titleKeywords?: string[]
   detailKeywords?: string[]
@@ -305,6 +326,26 @@ function workWeekFromDateInput(value: string) {
   return { start: toDateInputValue(monday), end: toDateInputValue(friday) }
 }
 
+function eventStartValue(ev: EventItem) {
+  return ev.start || (ev as EventItem & { start_at?: string }).start_at || ''
+}
+
+function dateFromEventStart(startValue?: string) {
+  if (!startValue) return null
+  const value = String(startValue)
+  const date = value.includes('T') ? new Date(value) : new Date(`${value.slice(0, 10)}T12:00:00`)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+function eventDayFilter(ev: EventItem): DayFilter | null {
+  const date = dateFromEventStart(eventStartValue(ev))
+  return date ? DAY_INDEX_TO_FILTER[date.getDay()] : null
+}
+
+function dayFilterLabel(dayFilter: DayFilter) {
+  return DAY_FILTERS.find(day => day.value === dayFilter)?.longLabel || 'selected day'
+}
+
 function normalizeText(value?: string) {
   return (value || '')
     .replace(/<[^>]+>/g, ' ')
@@ -515,6 +556,7 @@ export default function Events() {
   const [weeklyPersonalCommitmentMinutes, setWeeklyPersonalCommitmentMinutes] = useState(0)
   const [loading, setLoading] = useState(false)
   const [filter, setFilter] = useState<'all' | 'matched' | 'unmatched'>('all')
+  const [selectedDay, setSelectedDay] = useState<DayFilter>('all')
   const [matches, setMatches] = useState<Record<string, MatchEntry>>({})
   const [confirmedMatches, setConfirmedMatches] = useState<Record<string, MatchEntry>>({})
   const [taskSearches, setTaskSearches] = useState<Record<string, string>>({})
@@ -736,11 +778,20 @@ export default function Events() {
   const weeklyOverageMinutes = Math.max(weeklyLoggedMinutes - WORK_WEEK_TARGET_MINUTES, 0)
   const weeklyProgressPercent = Math.min((weeklyLoggedMinutes / WORK_WEEK_TARGET_MINUTES) * 100, 100)
 
-  const filtered = events.filter(e => {
+  const statusFiltered = events.filter(e => {
     if (filter === 'matched') return isMatched(e)
     if (filter === 'unmatched') return !isMatched(e)
     return true
   })
+
+  const dayCounts = DAY_FILTERS.reduce<Record<DayFilter, number>>((counts, day) => {
+    counts[day.value] = day.value === 'all'
+      ? statusFiltered.length
+      : statusFiltered.filter(e => eventDayFilter(e) === day.value).length
+    return counts
+  }, { all: 0, mon: 0, tue: 0, wed: 0, thu: 0, fri: 0 })
+
+  const filtered = statusFiltered.filter(e => selectedDay === 'all' || eventDayFilter(e) === selectedDay)
 
   const formatDuration = (minutes?: number) => {
     if (!minutes) return '0h'
@@ -833,7 +884,22 @@ export default function Events() {
       {actionStatus && <p className="action-status-text">{actionStatus}</p>}
 
       <div className="status-text">
-        {events.length} events · {matchedCount} matched · {events.length - matchedCount} unmatched
+        Showing {filtered.length} of {statusFiltered.length} visible events · {events.length} total · {matchedCount} matched · {events.length - matchedCount} unmatched
+      </div>
+
+      <div className="day-filter-bar" aria-label="Filter events by weekday">
+        {DAY_FILTERS.map(day => (
+          <button
+            key={day.value}
+            type="button"
+            className={`day-filter-btn ${selectedDay === day.value ? 'day-filter-btn-active' : ''}`}
+            aria-pressed={selectedDay === day.value}
+            onClick={() => setSelectedDay(day.value)}
+          >
+            <span>{day.label}</span>
+            <small>{dayCounts[day.value]}</small>
+          </button>
+        ))}
       </div>
 
       {events.length === 0 && !loading && !error && (
@@ -845,6 +911,12 @@ export default function Events() {
       {loading && events.length === 0 && (
         <div className="empty-state">
           <p>Loading events<span className="loading-dots" /></p>
+        </div>
+      )}
+
+      {events.length > 0 && filtered.length === 0 && !loading && !error && (
+        <div className="empty-state empty-state-filtered">
+          <p>No events found for {selectedDay === 'all' ? 'the current filters' : dayFilterLabel(selectedDay)}.</p>
         </div>
       )}
 
@@ -877,7 +949,7 @@ export default function Events() {
                   </span>
                 </div>
                 <div className="event-time">
-                  {formatDate(ev.start || (ev as EventItem & { start_at?: string }).start_at)} · {formatDuration(ev.duration_minutes)}
+                  {formatDate(eventStartValue(ev))} · {formatDuration(ev.duration_minutes)}
                   {ev._calendar_name ? ` · ${ev._calendar_name}` : ''}
                 </div>
                 <p className="event-description">{cleanDescription(ev.description)}</p>
