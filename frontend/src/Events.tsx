@@ -765,11 +765,27 @@ export default function Events() {
     setEnd(range.end)
   }
 
+  const suggestedTaskForProject = (eventId: string, projectId: number, projectTasks: TeamworkTask[]) => {
+    const ev = events.find(item => item.id === eventId)
+    if (!ev) return null
+    const suggestion = refineSuggestionWithTasks(ev, suggestForEvent(ev), projectTasks)
+    if (suggestion?.projectId === projectId && suggestion.taskId) return suggestion.taskId
+
+    const directTask = bestTaskSuggestion(ev, projectTasks)
+    if (directTask?.task?.id) return directTask.task.id
+
+    const text = eventText(ev)
+    if (['meeting', 'troubleshooting', 'call', 'touchpoint', 'review'].some(term => text.includes(term))) {
+      const preferredMeetingTask = projectTasks.find(task => normalizeText(taskDisplayName(task)).includes('daily weekly ad hoc meetings'))
+        || projectTasks.find(task => normalizeText(taskDisplayName(task)).includes('customer meetings'))
+        || projectTasks.find(task => normalizeText(taskDisplayName(task)).includes('meetings'))
+      if (preferredMeetingTask?.id) return preferredMeetingTask.id
+    }
+
+    return null
+  }
+
   const handleSelectProject = async (eventId: string, projectId: number | null) => {
-    setMatches(prev => ({
-      ...prev,
-      [eventId]: { eventId, projectId, taskId: null },
-    }))
     setConfirmedMatches(prev => {
       const next = { ...prev }
       delete next[eventId]
@@ -782,12 +798,23 @@ export default function Events() {
     })
     setTaskSearches(prev => ({ ...prev, [eventId]: '' }))
     setDeskTicketSearches(prev => ({ ...prev, [eventId]: '' }))
-    if (projectId) {
-      await Promise.all([
-        loadTasksForProject(projectId),
-        loadDeskTicketsForProject(projectId),
-      ])
+    if (!projectId) {
+      setMatches(prev => ({
+        ...prev,
+        [eventId]: { eventId, projectId: null, taskId: null },
+      }))
+      return
     }
+
+    const [projectTasks] = await Promise.all([
+      loadTasksForProject(projectId),
+      loadDeskTicketsForProject(projectId),
+    ])
+    const suggestedTaskId = suggestedTaskForProject(eventId, projectId, projectTasks)
+    setMatches(prev => ({
+      ...prev,
+      [eventId]: { eventId, projectId, taskId: suggestedTaskId },
+    }))
   }
 
   const handleSelectTask = (eventId: string, taskId: number | null) => {
@@ -843,14 +870,22 @@ export default function Events() {
     setSelectedDeskTickets(prev => ({ ...prev, [eventId]: ticket }))
     const linkedProjectId = ticket.projectIds?.[0]
     if (linkedProjectId) {
-      setMatches(prev => {
-        const existing = prev[eventId] || { eventId, projectId: null, taskId: null }
-        return { ...prev, [eventId]: { ...existing, projectId: linkedProjectId, taskId: existing.projectId === linkedProjectId ? existing.taskId : null } }
-      })
-      await Promise.all([
+      const [projectTasks] = await Promise.all([
         loadTasksForProject(linkedProjectId),
         loadDeskTicketsForProject(linkedProjectId),
       ])
+      const suggestedTaskId = suggestedTaskForProject(eventId, linkedProjectId, projectTasks)
+      setMatches(prev => {
+        const existing = prev[eventId] || { eventId, projectId: null, taskId: null }
+        return {
+          ...prev,
+          [eventId]: {
+            ...existing,
+            projectId: linkedProjectId,
+            taskId: existing.projectId === linkedProjectId && existing.taskId ? existing.taskId : suggestedTaskId,
+          },
+        }
+      })
     }
   }
 
