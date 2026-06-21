@@ -9,6 +9,8 @@ export interface EventItem {
   calendarId?: number
   type?: string
   mappedTaskIds?: number[] | null
+  staleMappedTaskIds?: number[] | null
+  liveLoggedTaskIds?: number[] | null
   attendees?: unknown[]
 }
 

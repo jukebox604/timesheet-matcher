@@ -546,8 +546,10 @@ function refineSuggestionWithTasks(ev: EventItem, suggestion: SuggestedMatch | n
 }
 
 function hasMappedTask(ev: EventItem) {
-  const maybe = ev as EventItem & { mappedTaskIds?: unknown }
-  return Array.isArray(maybe.mappedTaskIds) && maybe.mappedTaskIds.length > 0
+  const maybe = ev as EventItem & { mappedTaskIds?: unknown; liveLoggedTaskIds?: unknown }
+  const mappedIds = Array.isArray(maybe.mappedTaskIds) ? maybe.mappedTaskIds : []
+  const liveLoggedIds = Array.isArray(maybe.liveLoggedTaskIds) ? maybe.liveLoggedTaskIds : []
+  return mappedIds.length > 0 || liveLoggedIds.length > 0
 }
 
 function deskTicketText(ticket: DeskTicket) {

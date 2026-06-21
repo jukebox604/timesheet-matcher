@@ -175,11 +175,21 @@ def _event_start_value(event: dict[str, Any]) -> str:
 
 
 def _event_display_date(event: dict[str, Any]) -> str:
+    # Compare events in the user's local Teamwork timezone. Calendar payloads can
+    # include UTC timestamps, while Teamwork timelogs may expose either a raw UTC
+    # `timeLogged` or a local `date`; using the raw event date makes logged items
+    # look unmatched around timezone boundaries.
+    local = _event_local_date(event)
+    if local:
+        return local
     raw = _event_start_value(event)
     return raw[:10] if raw else ""
 
 
 def _event_start_time(event: dict[str, Any]) -> str:
+    parsed = _parse_event_datetime(_event_start_value(event))
+    if parsed:
+        return parsed.astimezone(FILLER_TIMEZONE).strftime("%H:%M:%S")
     raw = _event_start_value(event)
     return raw[11:19] if len(raw) >= 19 else ""
 
@@ -221,6 +231,24 @@ def _entry_raw_time(entry: dict[str, Any]) -> str:
     return raw[11:19] if len(raw) >= 19 else ""
 
 
+def _time_to_minutes(value: str) -> int | None:
+    if not value:
+        return None
+    try:
+        parts = value.split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+    except Exception:
+        return None
+
+
+def _times_within_minutes(a: str, b: str, tolerance: int) -> bool:
+    a_minutes = _time_to_minutes(a)
+    b_minutes = _time_to_minutes(b)
+    if a_minutes is None or b_minutes is None:
+        return True
+    return abs(a_minutes - b_minutes) <= tolerance
+
+
 def _timelog_matches_event(entry: dict[str, Any], event: dict[str, Any], task_id: int | str) -> bool:
     if _entry_task_id(entry) != str(task_id):
         return False
@@ -255,12 +283,22 @@ def _timelog_text_matches_event(entry: dict[str, Any], event: dict[str, Any]) ->
 
 
 def _timelog_matches_event_timebox(entry: dict[str, Any], event: dict[str, Any]) -> bool:
-    if _event_display_date(event) not in {_entry_date(entry), _entry_raw_date(entry)}:
+    event_dates = {_event_display_date(event)}
+    raw_event_start = _event_start_value(event)
+    if raw_event_start:
+        event_dates.add(raw_event_start[:10])
+    entry_dates = {_entry_date(entry), _entry_raw_date(entry)}
+    if not (event_dates - {""}) & (entry_dates - {""}):
         return False
-    if int(entry.get("minutes") or 0) != _event_duration_minutes(event):
+
+    entry_minutes = int(entry.get("minutes") or 0)
+    event_minutes = _event_duration_minutes(event)
+    if entry_minutes and event_minutes and abs(entry_minutes - event_minutes) > 15:
         return False
+
     event_time = _event_start_time(event)
-    if event_time and event_time not in {_entry_raw_time(entry), _entry_local_time(entry)}:
+    entry_times = [time for time in {_entry_raw_time(entry), _entry_local_time(entry)} if time]
+    if event_time and entry_times and not any(_times_within_minutes(event_time, entry_time, 30) for entry_time in entry_times):
         return False
     return True
 
