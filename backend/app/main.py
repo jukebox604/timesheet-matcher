@@ -187,11 +187,26 @@ def _event_display_date(event: dict[str, Any]) -> str:
 
 
 def _event_start_time(event: dict[str, Any]) -> str:
-    parsed = _parse_event_datetime(_event_start_value(event))
-    if parsed:
-        return parsed.astimezone(FILLER_TIMEZONE).strftime("%H:%M:%S")
     raw = _event_start_value(event)
     return raw[11:19] if len(raw) >= 19 else ""
+
+
+def _event_candidate_times(event: dict[str, Any]) -> set[str]:
+    """Return plausible event start times for Teamwork calendar matching.
+
+    Some Teamwork calendar events arrive with a trailing `Z` even though the
+    visible/logged time corresponds to the raw clock time, not the UTC-converted
+    Vancouver clock time. Keep both candidates so mapped timelogs are not marked
+    stale just because the calendar endpoint's timezone semantics are ambiguous.
+    """
+    candidates: set[str] = set()
+    raw = _event_start_value(event)
+    if len(raw) >= 19:
+        candidates.add(raw[11:19])
+    parsed = _parse_event_datetime(raw)
+    if parsed:
+        candidates.add(parsed.astimezone(FILLER_TIMEZONE).strftime("%H:%M:%S"))
+    return {candidate for candidate in candidates if candidate}
 
 
 def _event_duration_minutes(event: dict[str, Any]) -> int:
@@ -296,9 +311,13 @@ def _timelog_matches_event_timebox(entry: dict[str, Any], event: dict[str, Any])
     if entry_minutes and event_minutes and abs(entry_minutes - event_minutes) > 15:
         return False
 
-    event_time = _event_start_time(event)
+    event_times = _event_candidate_times(event)
     entry_times = [time for time in {_entry_raw_time(entry), _entry_local_time(entry)} if time]
-    if event_time and entry_times and not any(_times_within_minutes(event_time, entry_time, 30) for entry_time in entry_times):
+    if event_times and entry_times and not any(
+        _times_within_minutes(event_time, entry_time, 30)
+        for event_time in event_times
+        for entry_time in entry_times
+    ):
         return False
     return True
 
