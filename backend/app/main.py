@@ -47,6 +47,11 @@ DESK_COMPANY_ID_BY_PROJECT_COMPANY_NAME = {
     "wencor": 29740,
 }
 
+# Teamwork calendar mappings can point at a generic/customer task while the actual
+# logged meeting time is posted to a meeting task in the same project. Keep this
+# explicit and small; expand only when verified from live data.
+KNOWN_MEETING_TASK_IDS = {32199677}
+
 
 def _is_excluded_matching_event(event: dict[str, Any]) -> bool:
     title = str(event.get("title") or event.get("summary") or "").lower()
@@ -168,6 +173,39 @@ def _current_timelogs(client: TeamworkClient, start: str, end: str, user_id: str
         if isinstance(entry, dict)
         and (not user_id or not _entry_user_id(entry) or _entry_user_id(entry) == str(user_id))
     ]
+
+
+def _current_timesheet_rows(client: TeamworkClient, start: str, end: str, user_id: str) -> list[dict[str, Any]] | None:
+    """Return Teamwork timesheet summary rows for the requested user/date range.
+
+    The timelog endpoint can miss or hide detail rows for some already-logged
+    calendar events, while the timesheets endpoint still returns per-task daily
+    totals. Use this as a read-only reconciliation fallback.
+    """
+    try:
+        payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
+    except Exception:
+        return None
+    rows = payload.get("timesheets") or []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _timesheet_row_task_id(row: dict[str, Any]) -> int | None:
+    entity = row.get("entity") or {}
+    if not isinstance(entity, dict) or entity.get("type") != "tasks":
+        return None
+    try:
+        return int(entity.get("id"))
+    except Exception:
+        return None
+
+
+def _timesheet_row_minutes_for_date(row: dict[str, Any], day: str) -> int:
+    dates = row.get("dates") or {}
+    day_data = dates.get(day) if isinstance(dates, dict) else None
+    if not isinstance(day_data, dict):
+        return 0
+    return int(day_data.get("totalMinutes") or 0)
 
 
 def _event_start_value(event: dict[str, Any]) -> str:
@@ -326,16 +364,43 @@ def _timelog_matches_event_shape(entry: dict[str, Any], event: dict[str, Any]) -
     return _timelog_matches_event_timebox(entry, event) and _timelog_text_matches_event(entry, event)
 
 
-def _drop_stale_mapped_task_ids(events: list[dict[str, Any]], live_timelogs: list[dict[str, Any]] | None) -> None:
+def _is_meeting_event(event: dict[str, Any]) -> bool:
+    text = _plain_text(" ".join(str(event.get(key) or "") for key in ["title", "summary", "description"]))
+    return any(term in text for term in ["booking page", "join meeting", "meeting notes", "marc ramos and"])
+
+
+def _timesheet_summary_matches_event(event: dict[str, Any], rows: list[dict[str, Any]] | None) -> list[int]:
+    if not rows:
+        return []
+    event_day = _event_display_date(event)
+    event_minutes = _event_duration_minutes(event)
+    stale_ids = {int(task_id) for task_id in (event.get("staleMappedTaskIds") or []) if str(task_id).isdigit()}
+    matched_ids: list[int] = []
+    for row in rows:
+        task_id = _timesheet_row_task_id(row)
+        if not task_id:
+            continue
+        logged_minutes = _timesheet_row_minutes_for_date(row, event_day)
+        if not logged_minutes or event_minutes and abs(logged_minutes - event_minutes) > 15:
+            continue
+        if task_id in stale_ids or (_is_meeting_event(event) and task_id in KNOWN_MEETING_TASK_IDS):
+            if task_id not in matched_ids:
+                matched_ids.append(task_id)
+    return matched_ids
+
+
+def _drop_stale_mapped_task_ids(events: list[dict[str, Any]], live_timelogs: list[dict[str, Any]] | None, timesheet_rows: list[dict[str, Any]] | None = None) -> None:
     """Reconcile calendar mappedTaskIds with live timelogs.
 
     Calendar mappedTaskIds can be stale after deletion, while recurring/event
     edge cases can have a real timelog without mappedTaskIds. Use exact
     event-shaped live timelogs (date, duration, start time, title/description)
-    to decide the displayed logged state.
+    first, then Teamwork timesheet summary rows as a fallback for logged events
+    whose timelog details are missing from the timelog endpoint.
     """
-    if live_timelogs is None:
+    if live_timelogs is None and timesheet_rows is None:
         return
+    live_timelogs = live_timelogs or []
     for event in events:
         mapped = event.get("mappedTaskIds")
         original_mapped = mapped if isinstance(mapped, list) else []
@@ -355,8 +420,19 @@ def _drop_stale_mapped_task_ids(events: list[dict[str, Any]], live_timelogs: lis
                 event["staleMappedTaskIds"] = original_mapped
             event["mappedTaskIds"] = live_task_ids
             event["liveLoggedTaskIds"] = live_task_ids
-        elif original_mapped:
+            continue
+
+        if original_mapped:
             event["staleMappedTaskIds"] = original_mapped
+        summary_task_ids = _timesheet_summary_matches_event(event, timesheet_rows)
+        if summary_task_ids:
+            if original_mapped and set(int(task_id) for task_id in original_mapped if str(task_id).isdigit()) != set(summary_task_ids):
+                event["staleMappedTaskIds"] = original_mapped
+            else:
+                event.pop("staleMappedTaskIds", None)
+            event["mappedTaskIds"] = summary_task_ids
+            event["liveLoggedTaskIds"] = summary_task_ids
+        elif original_mapped:
             event["mappedTaskIds"] = []
 
 
@@ -692,8 +768,10 @@ def get_events(
 
     all_events = [ev for ev in all_events if not _is_excluded_matching_event(ev)]
 
-    live_timelogs = _current_timelogs(client, start, end, teamwork_settings.user_id or "")
-    _drop_stale_mapped_task_ids(all_events, live_timelogs)
+    effective_user_id = teamwork_settings.user_id or ""
+    live_timelogs = _current_timelogs(client, start, end, effective_user_id)
+    timesheet_rows = _current_timesheet_rows(client, start, end, effective_user_id)
+    _drop_stale_mapped_task_ids(all_events, live_timelogs, timesheet_rows)
 
     # Sort by start_at
     all_events.sort(key=lambda e: str(e.get("start_at", "")))
