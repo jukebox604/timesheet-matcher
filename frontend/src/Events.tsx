@@ -528,6 +528,36 @@ function bestTaskSuggestion(ev: EventItem, projectTasks: TeamworkTask[]) {
   return ranked[0] || null
 }
 
+function isMeetingLikeText(text: string) {
+  return ['meeting', 'discussion', 'call', 'touchpoint', 'review', 'troubleshooting'].some(term => text.includes(term))
+}
+
+function preferredMeetingTask(projectTasks: TeamworkTask[]) {
+  return projectTasks.find(task => normalizeText(taskDisplayName(task)).includes('daily weekly ad hoc meetings'))
+    || projectTasks.find(task => normalizeText(taskDisplayName(task)).includes('customer meetings'))
+    || projectTasks.find(task => normalizeText(taskDisplayName(task)).includes('meetings'))
+}
+
+function scoreTaskAgainstText(task: TeamworkTask, text: string) {
+  const taskText = normalizeText(taskDisplayName(task))
+  const words = meaningfulWords(taskText)
+  if (!words.length) return 0
+  const matchedWords = words.filter(word => text.includes(word))
+  const coverage = matchedWords.length / words.length
+  return matchedWords.length * 25 + coverage * 100
+}
+
+function bestTaskForDeskTicket(ticket: DeskTicket, projectTasks: TeamworkTask[]) {
+  const ticketText = deskTicketText(ticket)
+  const ranked = projectTasks
+    .map(task => ({ task, score: scoreTaskAgainstText(task, ticketText) }))
+    .filter(result => result.score >= 80)
+    .sort((a, b) => b.score - a.score)
+  if (ranked[0]?.task.id) return ranked[0].task.id
+  if (isMeetingLikeText(ticketText)) return preferredMeetingTask(projectTasks)?.id || null
+  return null
+}
+
 function refineSuggestionWithTasks(ev: EventItem, suggestion: SuggestedMatch | null, projectTasks: TeamworkTask[] = []): SuggestedMatch | null {
   if (!suggestion) return null
   if (suggestion.taskId) return suggestion
@@ -773,16 +803,15 @@ export default function Events() {
     const suggestion = refineSuggestionWithTasks(ev, suggestForEvent(ev), projectTasks)
     if (suggestion?.projectId === projectId && suggestion.taskId) return suggestion.taskId
 
+    const text = eventText(ev)
+    const eventLooksLikeMeeting = isMeetingLikeText(text)
+    if (eventLooksLikeMeeting) {
+      const meetingTask = preferredMeetingTask(projectTasks)
+      if (meetingTask?.id) return meetingTask.id
+    }
+
     const directTask = bestTaskSuggestion(ev, projectTasks)
     if (directTask?.task?.id) return directTask.task.id
-
-    const text = eventText(ev)
-    if (['meeting', 'troubleshooting', 'call', 'touchpoint', 'review'].some(term => text.includes(term))) {
-      const preferredMeetingTask = projectTasks.find(task => normalizeText(taskDisplayName(task)).includes('daily weekly ad hoc meetings'))
-        || projectTasks.find(task => normalizeText(taskDisplayName(task)).includes('customer meetings'))
-        || projectTasks.find(task => normalizeText(taskDisplayName(task)).includes('meetings'))
-      if (preferredMeetingTask?.id) return preferredMeetingTask.id
-    }
 
     return null
   }
@@ -876,7 +905,7 @@ export default function Events() {
         loadTasksForProject(linkedProjectId),
         loadDeskTicketsForProject(linkedProjectId),
       ])
-      const suggestedTaskId = suggestedTaskForProject(eventId, linkedProjectId, projectTasks)
+      const suggestedTaskId = bestTaskForDeskTicket(ticket, projectTasks) || suggestedTaskForProject(eventId, linkedProjectId, projectTasks)
       setMatches(prev => {
         const existing = prev[eventId] || { eventId, projectId: null, taskId: null }
         return {
@@ -884,7 +913,11 @@ export default function Events() {
           [eventId]: {
             ...existing,
             projectId: linkedProjectId,
-            taskId: existing.projectId === linkedProjectId && existing.taskId ? existing.taskId : suggestedTaskId,
+            // A Desk ticket is not itself a Teamwork Projects task. When the user
+            // chooses a Desk ticket, prefer a task inferred from that ticket (or a
+            // meeting fallback) instead of keeping an unrelated auto-suggested task
+            // such as EDI from the original event text.
+            taskId: suggestedTaskId || (existing.projectId === linkedProjectId ? existing.taskId : null),
           },
         }
       })
@@ -1200,7 +1233,7 @@ export default function Events() {
                     </select>
                     {selectedDeskTicket ? (
                       <small className="desk-ticket-detail">
-                        {selectedDeskTicket.companyName || 'Desk'} · {selectedDeskTicket.status || 'status unknown'} · time description will include Desk #{selectedDeskTicket.id}
+                        {selectedDeskTicket.companyName || 'Desk'} · {selectedDeskTicket.status || 'status unknown'} · Desk #{selectedDeskTicket.id} will be added to the time description; Teamwork still logs the time to the project task selected below.
                       </small>
                     ) : selectedProject ? (
                       <small className="desk-ticket-detail">Search/select a Desk ticket to pair it with this project/task match.</small>
