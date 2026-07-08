@@ -946,6 +946,7 @@ export default function Events() {
           projectId: Number(match!.projectId),
           taskId: Number(match!.taskId),
           mappedTaskIds: ev.mappedTaskIds,
+          source: ev.source,
           deskTicketId: deskTicket?.id,
           deskTicketSubject: deskTicket?.subject,
         }

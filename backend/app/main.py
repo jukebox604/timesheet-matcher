@@ -15,6 +15,7 @@ from app.teamwork import TeamworkClient, get_teamwork_settings, teamwork_status_
 from app.models import init_db, insert_proposal
 from app.matcher import match_and_propose
 from app.auth import router as auth_router
+from app.google_calendar import list_google_calendar_events, google_calendar_configured
 
 EXCLUDED_MATCHING_EVENT_TITLES = (
     "am email review",
@@ -84,6 +85,41 @@ def _clean_event_description(description: str | None) -> str:
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _normalize_google_calendar_event(event: dict[str, Any]) -> dict[str, Any]:
+    start = event.get("start") or {}
+    end = event.get("end") or {}
+    start_at = start.get("dateTime") or start.get("date") or "" if isinstance(start, dict) else str(start or "")
+    end_at = end.get("dateTime") or end.get("date") or "" if isinstance(end, dict) else str(end or "")
+    all_day = isinstance(start, dict) and bool(start.get("date")) and not start.get("dateTime")
+    normalized = {
+        **event,
+        "id": f"google:{event.get('id', '')}",
+        "googleEventId": event.get("id"),
+        "source": "google",
+        "calendarId": "google",
+        "_calendar_name": "Doppio Google Calendar",
+        "title": event.get("summary") or event.get("title") or "Untitled event",
+        "description": _clean_event_description(event.get("description")),
+        "start": start_at,
+        "end": end_at,
+        "start_at": start_at,
+        "end_at": end_at,
+        "allDay": all_day,
+        "attendees": event.get("attendees") or [],
+        "mappedTaskIds": [],
+    }
+    if normalized.get("duration_minutes") is None and start_at and end_at and not all_day:
+        try:
+            s = datetime.fromisoformat(str(start_at).replace("Z", "+00:00"))
+            e = datetime.fromisoformat(str(end_at).replace("Z", "+00:00"))
+            normalized["duration_minutes"] = int((e - s).total_seconds() / 60)
+        except Exception:
+            normalized["duration_minutes"] = 0
+    elif all_day:
+        normalized["duration_minutes"] = 480
+    return normalized
 
 
 def _event_datetime_value(event: dict[str, Any], key: str) -> str:
@@ -481,6 +517,27 @@ def _calendar_timelog_payload(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _plain_task_time_entry_payload(entry: dict[str, Any], user_id: str) -> dict[str, Any]:
+    timelog = _calendar_timelog_payload(entry)
+    hours, minutes = divmod(int(timelog["minutes"]), 60)
+    description_parts = [str(entry.get("title") or "Calendar event")]
+    description = str(timelog.get("description") or "").strip()
+    if description and description not in description_parts:
+        description_parts.append(description)
+    desk_ticket_id = entry.get("deskTicketId")
+    if desk_ticket_id:
+        description_parts.append(f"Desk ticket #{desk_ticket_id}: {entry.get('deskTicketSubject') or ''}".strip())
+    return {
+        "description": "\n\n".join(part for part in description_parts if part).strip(),
+        "person-id": str(user_id),
+        "date": str(timelog["date"]).replace("-", ""),
+        "time": str(timelog["time"])[:5],
+        "hours": str(hours),
+        "minutes": str(minutes),
+        "isbillable": "1" if timelog.get("isBillable") else "0",
+    }
+
+
 def _date_strings(start: str, end: str) -> list[str]:
     try:
         current = _parse_date(start).date()
@@ -556,7 +613,11 @@ def _personal_commitment_daily_totals(client: TeamworkClient, start: str, end: s
     if not dates:
         return totals, []
     events: list[dict[str, Any]] = []
-    for event in client.get_calendar_events(1306, start, end):
+    try:
+        source_events = [_normalize_google_calendar_event(event) for event in list_google_calendar_events(start, end)] if google_calendar_configured() else client.get_calendar_events(1306, start, end)
+    except Exception:
+        source_events = client.get_calendar_events(1306, start, end)
+    for event in source_events:
         if not _is_personal_commitment_event(event):
             continue
         day = _event_local_date(event)
@@ -699,54 +760,63 @@ def get_events(
     if not teamwork_settings.has_credentials:
         raise HTTPException(status_code=503, detail="Teamwork is not configured")
     client = TeamworkClient(settings=teamwork_settings)
-    try:
-        calendars = client.list_calendars()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch calendars: {exc}")
 
     all_events: list[dict[str, Any]] = []
-    # The matching page is driven from Marc's Google-synced calendar. Avoid the
-    # blocked_time calendar here; it is for project-linked time blocks, not the
-    # personal calendar import flow.
-    target_calendars = [cal for cal in calendars if str(cal.get("id")) == "1306"] or calendars
-    for cal in target_calendars:
-        cal_id = cal.get("id")
-        if not cal_id:
-            continue
+    event_source = "google" if google_calendar_configured() else "teamwork"
+    if event_source == "google":
         try:
-            events = client.get_calendar_events(cal_id, start, end)
-            for ev in events:
-                ev["_calendar_name"] = cal.get("name", "")
-                ev["calendarId"] = cal_id
-                # Normalize field names
-                ev["title"] = ev.get("summary", ev.get("title", ""))
-                ev["description"] = _clean_event_description(ev.get("description"))
-                ev_start = ev.get("start", {})
-                ev_end = ev.get("end", {})
-                if isinstance(ev_start, dict):
-                    ev["start_at"] = ev_start.get("dateTime", "")
-                else:
-                    ev["start_at"] = str(ev_start)
-                if isinstance(ev_end, dict):
-                    ev["end_at"] = ev_end.get("dateTime", "")
-                else:
-                    ev["end_at"] = str(ev_end)
-                # Frontend expects strings; do not leak Teamwork's nested start/end dicts.
-                ev["start"] = ev.get("start_at", "")
-                ev["end"] = ev.get("end_at", "")
-                # Compute duration in minutes
-                if ev.get("duration_minutes") is None and ev["start_at"] and ev["end_at"]:
-                    try:
-                        s = datetime.fromisoformat(ev["start_at"].replace("Z", "+00:00"))
-                        e = datetime.fromisoformat(ev["end_at"].replace("Z", "+00:00"))
-                        ev["duration_minutes"] = int((e - s).total_seconds() / 60)
-                    except Exception:
-                        ev["duration_minutes"] = 0
-            all_events.extend(events)
-        except Exception:
-            pass
+            all_events = [_normalize_google_calendar_event(event) for event in list_google_calendar_events(start, end)]
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch Google Calendar events: {exc}")
+    else:
+        try:
+            calendars = client.list_calendars()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch calendars: {exc}")
 
-    # Teamwork calendar endpoints can ignore date params; filter on normalized start_at here.
+        # Legacy Teamwork fallback. Teamwork's calendar APIs have become unreliable
+        # for the personal calendar feed, so production should connect Google
+        # Calendar by re-running Google login with calendar consent.
+        target_calendars = [cal for cal in calendars if str(cal.get("id")) == "1306"] or calendars
+        for cal in target_calendars:
+            cal_id = cal.get("id")
+            if not cal_id:
+                continue
+            try:
+                events = client.get_calendar_events(cal_id, start, end)
+                for ev in events:
+                    ev["source"] = "teamwork"
+                    ev["_calendar_name"] = cal.get("name", "")
+                    ev["calendarId"] = cal_id
+                    # Normalize field names
+                    ev["title"] = ev.get("summary", ev.get("title", ""))
+                    ev["description"] = _clean_event_description(ev.get("description"))
+                    ev_start = ev.get("start", {})
+                    ev_end = ev.get("end", {})
+                    if isinstance(ev_start, dict):
+                        ev["start_at"] = ev_start.get("dateTime", "")
+                    else:
+                        ev["start_at"] = str(ev_start)
+                    if isinstance(ev_end, dict):
+                        ev["end_at"] = ev_end.get("dateTime", "")
+                    else:
+                        ev["end_at"] = str(ev_end)
+                    # Frontend expects strings; do not leak Teamwork's nested start/end dicts.
+                    ev["start"] = ev.get("start_at", "")
+                    ev["end"] = ev.get("end_at", "")
+                    # Compute duration in minutes
+                    if ev.get("duration_minutes") is None and ev["start_at"] and ev["end_at"]:
+                        try:
+                            s = datetime.fromisoformat(ev["start_at"].replace("Z", "+00:00"))
+                            e = datetime.fromisoformat(ev["end_at"].replace("Z", "+00:00"))
+                            ev["duration_minutes"] = int((e - s).total_seconds() / 60)
+                        except Exception:
+                            ev["duration_minutes"] = 0
+                all_events.extend(events)
+            except Exception:
+                pass
+
+    # Calendar endpoints can ignore date params; filter on normalized start_at here.
     try:
         filter_start = datetime.strptime(start, "%Y-%m-%d").date()
         filter_end = datetime.strptime(end, "%Y-%m-%d").date()
@@ -777,7 +847,7 @@ def get_events(
     all_events.sort(key=lambda e: str(e.get("start_at", "")))
 
     return {
-        "query": {"start": start, "end": end},
+        "query": {"start": start, "end": end, "source": event_source},
         "count": len(all_events),
         "events": all_events,
     }
@@ -962,8 +1032,14 @@ def submit_matched(payload: dict[str, Any]) -> dict[str, object]:
             skipped.append({"eventId": event_id, "reason": "zero duration"})
             continue
         try:
-            result = client.log_calendar_event_time(entry.get("calendarId") or 1306, event_id, timelog)
-            created.append({"eventId": event_id, "taskId": timelog["taskId"], "minutes": timelog["minutes"], "result": result})
+            if entry.get("source") == "google" or str(entry.get("calendarId") or "") == "google" or event_id.startswith("google:"):
+                time_entry = _plain_task_time_entry_payload(entry, teamwork_settings.user_id or "531538")
+                task_id = int(entry["taskId"])
+                result = client.create_task_time_entry(task_id, time_entry)
+                created.append({"eventId": event_id, "taskId": task_id, "minutes": timelog["minutes"], "source": "google", "result": result})
+            else:
+                result = client.log_calendar_event_time(entry.get("calendarId") or 1306, event_id, timelog)
+                created.append({"eventId": event_id, "taskId": timelog["taskId"], "minutes": timelog["minutes"], "source": "teamwork", "result": result})
         except Exception as exc:
             errors.append({"eventId": event_id, "error": str(exc)})
 

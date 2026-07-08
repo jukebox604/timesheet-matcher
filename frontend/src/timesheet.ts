@@ -6,11 +6,12 @@ export interface EventItem {
   end?: string
   duration_minutes?: number
   _calendar_name?: string
-  calendarId?: number
+  calendarId?: number | string
   type?: string
   mappedTaskIds?: number[] | null
   staleMappedTaskIds?: number[] | null
   liveLoggedTaskIds?: number[] | null
+  source?: string
   attendees?: unknown[]
 }
 
@@ -108,7 +109,7 @@ export async function fetchDeskTickets(params: { projectId?: number; ticketId?: 
 
 export interface SubmitMatchedEntry {
   eventId: string
-  calendarId?: number
+  calendarId?: number | string
   title?: string
   description?: string
   start?: string
@@ -118,6 +119,7 @@ export interface SubmitMatchedEntry {
   projectId: number
   taskId: number
   mappedTaskIds?: number[] | null
+  source?: string
   deskTicketId?: number
   deskTicketSubject?: string
 }
