@@ -961,6 +961,7 @@ export default function Events() {
           source: ev.source,
           deskTicketId: deskTicket?.id,
           deskTicketSubject: deskTicket?.subject,
+          isBillable: true,
         }
       })
     if (entries.length === 0) {

@@ -521,7 +521,10 @@ def _calendar_timelog_payload(entry: dict[str, Any]) -> dict[str, Any]:
         "description": str(entry.get("description") or f"Event: {entry.get('title', '')}"),
         "projectId": int(entry["projectId"]),
         "taskId": int(entry["taskId"]),
-        "isBillable": bool(entry.get("isBillable", False)),
+        # Matched calendar/client work should default to billable unless the
+        # frontend explicitly sends isBillable=false. Time filler entries use a
+        # separate path and remain non-billable.
+        "isBillable": True if "isBillable" not in entry else bool(entry.get("isBillable")),
     }
 
 

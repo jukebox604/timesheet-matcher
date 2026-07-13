@@ -135,6 +135,7 @@ export interface SubmitMatchedEntry {
   source?: string
   deskTicketId?: number
   deskTicketSubject?: string
+  isBillable?: boolean
 }
 
 export async function submitMatchedEntries(entries: SubmitMatchedEntry[]): Promise<{ status: string; created: unknown[]; skipped: unknown[]; errors: unknown[] }> {
