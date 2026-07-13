@@ -158,6 +158,8 @@ export interface FillerPlanResponse {
   skipped: Array<{ date?: string; description?: string; reason?: string }>
   existingDates?: string[]
   dailyTotals: Record<string, number>
+  unavailableDailyTotals?: Record<string, number>
+  creditedDailyTotals?: Record<string, number>
   weeklyCurrentMinutes: number
   weeklyTargetMinutes: number
   weeklyRemainingMinutes: number
@@ -172,6 +174,8 @@ export interface FillerCreateResponse {
   created: unknown[]
   skipped: unknown[]
   dailyTotals: Record<string, number>
+  unavailableDailyTotals?: Record<string, number>
+  creditedDailyTotals?: Record<string, number>
   weeklyTargetMinutes: number
   weeklyRemainingMinutes: number
   fillerTaskId: number

@@ -1173,7 +1173,7 @@ export default function Events() {
             <div>
               <span className="week-progress-label">Proposed 40h filler plan</span>
               <strong>{formatHours(fillerPlan.plannedMinutes)} planned · projected {formatHours(fillerPlan.projectedWeeklyMinutes)} / 40.0h</strong>
-              <small className="week-progress-detail">Task {fillerPlan.fillerTaskId} · {formatHours(fillerPlan.weeklyCurrentMinutes)} currently logged · {formatHours(fillerPlan.weeklyRemainingMinutes)} short before filler</small>
+              <small className="week-progress-detail">Task {fillerPlan.fillerTaskId} · {formatHours(fillerPlan.weeklyCurrentMinutes)} credited logged + unavailable · {formatHours(fillerPlan.weeklyRemainingMinutes)} short before filler</small>
             </div>
             <div className="filler-plan-actions">
               <button className="btn btn-primary btn-small" onClick={handleCreateApprovedFiller} disabled={runningFiller || fillerPlan.plan.length === 0}>

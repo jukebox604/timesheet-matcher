@@ -1124,7 +1124,15 @@ def _build_timesheet_filler_plan(client: TeamworkClient, start: str, end: str, u
     existing = _existing_timelogs(client, start, existing_end, user_id)
     totals_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
     daily_totals = ((totals_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(totals_payload, dict) else {}
-    weekly_current_minutes = sum(int(daily_totals.get(day.isoformat()) or 0) for day in workdays)
+    try:
+        unavailable_totals, _unavailable_events = _unavailable_daily_totals(client, start, end, user_id)
+    except Exception:
+        unavailable_totals = {}
+    credited_totals = {
+        day.isoformat(): int(daily_totals.get(day.isoformat(), 0) or 0) + int(unavailable_totals.get(day.isoformat(), 0) or 0)
+        for day in workdays
+    }
+    weekly_current_minutes = sum(int(credited_totals.get(day.isoformat()) or 0) for day in workdays)
     weekly_remaining_minutes = max(WORK_WEEK_TARGET_MINUTES - weekly_current_minutes, 0)
 
     existing_filler_dates = sorted({
@@ -1146,7 +1154,7 @@ def _build_timesheet_filler_plan(client: TeamworkClient, start: str, end: str, u
         if remaining_to_fill <= 0:
             break
         date_key = day.isoformat()
-        day_logged = int(daily_totals.get(date_key) or 0)
+        day_logged = int(credited_totals.get(date_key) or 0)
         day_capacity = max(WORK_DAY_TARGET_MINUTES - day_logged, 0)
         day_to_fill = min(day_capacity, remaining_to_fill)
         if day_to_fill <= 0:
@@ -1181,6 +1189,8 @@ def _build_timesheet_filler_plan(client: TeamworkClient, start: str, end: str, u
         "skipped": skipped,
         "existingDates": existing_filler_dates,
         "dailyTotals": daily_totals,
+        "unavailableDailyTotals": unavailable_totals,
+        "creditedDailyTotals": credited_totals,
         "weeklyCurrentMinutes": weekly_current_minutes,
         "weeklyTargetMinutes": WORK_WEEK_TARGET_MINUTES,
         "weeklyRemainingMinutes": weekly_remaining_minutes,
@@ -1271,7 +1281,15 @@ def create_approved_timesheet_filler(payload: dict[str, Any]) -> dict[str, objec
 
         verify_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
         verified_daily_totals = ((verify_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(verify_payload, dict) else {}
-        verified_weekly_minutes = sum(int(verified_daily_totals.get(day.isoformat()) or 0) for day in workdays)
+        try:
+            verified_unavailable_totals, _verified_unavailable_events = _unavailable_daily_totals(client, start, end, str(user_id))
+        except Exception:
+            verified_unavailable_totals = {}
+        verified_credited_totals = {
+            day.isoformat(): int(verified_daily_totals.get(day.isoformat(), 0) or 0) + int(verified_unavailable_totals.get(day.isoformat(), 0) or 0)
+            for day in workdays
+        }
+        verified_weekly_minutes = sum(int(verified_credited_totals.get(day.isoformat()) or 0) for day in workdays)
         verified_remaining_minutes = max(WORK_WEEK_TARGET_MINUTES - verified_weekly_minutes, 0)
         status = "ok" if created and verified_remaining_minutes == 0 else ("partial" if created else "exists")
         return {
@@ -1280,6 +1298,8 @@ def create_approved_timesheet_filler(payload: dict[str, Any]) -> dict[str, objec
             "created": created,
             "skipped": skipped,
             "dailyTotals": verified_daily_totals,
+            "unavailableDailyTotals": verified_unavailable_totals,
+            "creditedDailyTotals": verified_credited_totals,
             "weeklyTargetMinutes": WORK_WEEK_TARGET_MINUTES,
             "weeklyRemainingMinutes": verified_remaining_minutes,
             "fillerTaskId": FILLER_TASK_ID,
