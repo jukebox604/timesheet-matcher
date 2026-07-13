@@ -33,10 +33,17 @@ RECLAIM_DESCRIPTION_BOILERPLATE = (
 FILLER_PROJECT_ID = 417162
 FILLER_TASK_ID = 29936460
 FILLER_DESCRIPTION = "Teamwork, Teamdesk, Slack, Email and Jira"
+FILLER_CATEGORIES = (
+    {"key": "slack_ticket_jira", "description": "Slack / Ticket / Jira Reviews", "max_minutes_per_day": 120, "start_time": "17:00"},
+    {"key": "email_admin", "description": "Email / Administration", "max_minutes_per_day": 60, "start_time": "19:00"},
+    {"key": "general_admin", "description": FILLER_DESCRIPTION, "max_minutes_per_day": 120, "start_time": "20:00"},
+)
 FILLER_START_TIME = "20:00"
 FILLER_HOURS = 1
 FILLER_MINUTES = 30
 FILLER_BILLABLE = "0"
+WORK_WEEK_TARGET_MINUTES = 40 * 60
+WORK_DAY_TARGET_MINUTES = 8 * 60
 FILLER_TIMEZONE = ZoneInfo("America/Vancouver")
 FILLER_LOCKS: dict[str, Lock] = {}
 FILLER_LOCKS_GUARD = Lock()
@@ -1132,53 +1139,99 @@ def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
 
         existing_end = (end_date + timedelta(days=1)).isoformat()
         existing = _existing_timelogs(client, start, existing_end, user_id)
+        totals_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
+        daily_totals = ((totals_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(totals_payload, dict) else {}
+        weekly_logged_minutes = sum(int(daily_totals.get(day.isoformat()) or 0) for day in workdays)
+        weekly_remaining_minutes = max(WORK_WEEK_TARGET_MINUTES - weekly_logged_minutes, 0)
+
         existing_filler_dates = sorted({
             day.isoformat()
             for day in workdays
             if any(_entry_matches(e, date=day.isoformat(), task_id=FILLER_TASK_ID, description=FILLER_DESCRIPTION) for e in existing)
         })
-
-        existing_filler_date_set = set(existing_filler_dates)
-        missing_workdays = [day for day in workdays if day.isoformat() not in existing_filler_date_set]
+        existing_by_date_description = {
+            (day.isoformat(), str(category["description"]))
+            for day in workdays
+            for category in FILLER_CATEGORIES
+            if any(_entry_matches(e, date=day.isoformat(), task_id=FILLER_TASK_ID, description=str(category["description"])) for e in existing)
+        }
 
         created: list[dict[str, Any]] = []
-        skipped: list[dict[str, Any]] = [
-            {"date": day.isoformat(), "reason": "filler entry already exists for this date"}
-            for day in workdays
-            if day.isoformat() in existing_filler_date_set
-        ]
-        for day in missing_workdays:
+        skipped: list[dict[str, Any]] = []
+        plan: list[dict[str, Any]] = []
+        remaining_to_fill = weekly_remaining_minutes
+        for day in workdays:
+            if remaining_to_fill <= 0:
+                break
             date_key = day.isoformat()
+            day_logged = int(daily_totals.get(date_key) or 0)
+            day_capacity = max(WORK_DAY_TARGET_MINUTES - day_logged, 0)
+            day_to_fill = min(day_capacity, remaining_to_fill)
+            if day_to_fill <= 0:
+                continue
+            for category in FILLER_CATEGORIES:
+                if day_to_fill <= 0 or remaining_to_fill <= 0:
+                    break
+                description = str(category["description"])
+                if (date_key, description) in existing_by_date_description:
+                    skipped.append({"date": date_key, "description": description, "reason": "filler category already exists for this date"})
+                    continue
+                minutes = min(int(category["max_minutes_per_day"]), day_to_fill, remaining_to_fill)
+                # Keep Teamwork entries on quarter-hour boundaries.
+                minutes = (minutes // 15) * 15
+                if minutes <= 0:
+                    continue
+                plan.append({
+                    "date": date_key,
+                    "description": description,
+                    "minutes": minutes,
+                    "startTime": str(category["start_time"]),
+                    "taskId": FILLER_TASK_ID,
+                })
+                day_to_fill -= minutes
+                remaining_to_fill -= minutes
+
+        for item in plan:
+            date_key = str(item["date"])
+            minutes = int(item["minutes"])
             time_entry = {
-                "description": FILLER_DESCRIPTION,
+                "description": str(item["description"]),
                 "person-id": str(user_id),
-                "date": day.strftime("%Y%m%d"),
-                "time": FILLER_START_TIME,
-                "hours": str(FILLER_HOURS),
-                "minutes": str(FILLER_MINUTES),
+                "date": datetime.strptime(date_key, "%Y-%m-%d").strftime("%Y%m%d"),
+                "time": str(item["startTime"]),
+                "hours": str(minutes // 60),
+                "minutes": str(minutes % 60),
                 "isbillable": FILLER_BILLABLE,
             }
             try:
                 result = client.create_task_time_entry(FILLER_TASK_ID, time_entry)
-                created.append({"date": date_key, "taskId": FILLER_TASK_ID, "result": result})
+                created.append({"date": date_key, "description": item["description"], "minutes": minutes, "taskId": FILLER_TASK_ID, "result": result})
             except Exception as exc:
-                skipped.append({"date": date_key, "reason": str(exc)})
+                skipped.append({"date": date_key, "description": item["description"], "minutes": minutes, "reason": str(exc)})
 
         verify_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
-        daily_totals = ((verify_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(verify_payload, dict) else {}
+        verified_daily_totals = ((verify_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(verify_payload, dict) else {}
+        verified_weekly_minutes = sum(int(verified_daily_totals.get(day.isoformat()) or 0) for day in workdays)
+        verified_remaining_minutes = max(WORK_WEEK_TARGET_MINUTES - verified_weekly_minutes, 0)
         if created:
-            status = "ok" if not any(item["date"] in {day.isoformat() for day in missing_workdays} and item.get("reason") for item in skipped) else "partial"
-            message = f"Created {len(created)} Time Sheet Filler entries; skipped {len(skipped)} existing/failed dates."
+            status = "ok" if verified_remaining_minutes == 0 else "partial"
+            message = f"Created {len(created)} categorized Time Sheet Filler entries using task {FILLER_TASK_ID}; week is now {(verified_weekly_minutes / 60):.2f}h / 40.0h."
+        elif weekly_remaining_minutes <= 0:
+            status = "exists"
+            message = "Week is already at or over 40.0h. No filler entries were created."
         else:
-            status = "exists" if existing_filler_dates else "partial"
-            message = f"Time Sheet Filler entries already exist for {', '.join(existing_filler_dates)}. No new filler entries were created." if existing_filler_dates else f"Created 0 Time Sheet Filler entries; skipped {len(skipped)}."
+            status = "exists" if skipped else "partial"
+            message = f"No new filler entries were created; week remains {(verified_weekly_minutes / 60):.2f}h / 40.0h."
         return {
             "status": status,
             "message": message,
             "created": created,
             "skipped": skipped,
             "existingDates": existing_filler_dates,
-            "dailyTotals": daily_totals,
+            "dailyTotals": verified_daily_totals,
+            "weeklyTargetMinutes": WORK_WEEK_TARGET_MINUTES,
+            "weeklyRemainingMinutes": verified_remaining_minutes,
+            "fillerTaskId": FILLER_TASK_ID,
         }
     finally:
         lock.release()
