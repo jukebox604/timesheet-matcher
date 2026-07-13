@@ -1138,27 +1138,16 @@ def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
             if any(_entry_matches(e, date=day.isoformat(), task_id=FILLER_TASK_ID, description=FILLER_DESCRIPTION) for e in existing)
         })
 
-        # If any standard filler entries already exist in the loaded range, do not
-        # create a partial second set. This keeps the button safe and makes the
-        # duplicate state obvious to the user.
-        if existing_filler_dates:
-            verify_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
-            daily_totals = ((verify_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(verify_payload, dict) else {}
-            return {
-                "status": "exists",
-                "message": f"Time Sheet Filler entries already exist for {', '.join(existing_filler_dates)}. No new filler entries were created.",
-                "created": [],
-                "skipped": [
-                    {"date": day.isoformat(), "reason": "filler entries already exist in this loaded range"}
-                    for day in workdays
-                ],
-                "existingDates": existing_filler_dates,
-                "dailyTotals": daily_totals,
-            }
+        existing_filler_date_set = set(existing_filler_dates)
+        missing_workdays = [day for day in workdays if day.isoformat() not in existing_filler_date_set]
 
         created: list[dict[str, Any]] = []
-        skipped: list[dict[str, Any]] = []
-        for day in workdays:
+        skipped: list[dict[str, Any]] = [
+            {"date": day.isoformat(), "reason": "filler entry already exists for this date"}
+            for day in workdays
+            if day.isoformat() in existing_filler_date_set
+        ]
+        for day in missing_workdays:
             date_key = day.isoformat()
             time_entry = {
                 "description": FILLER_DESCRIPTION,
@@ -1177,12 +1166,18 @@ def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
 
         verify_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
         daily_totals = ((verify_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(verify_payload, dict) else {}
+        if created:
+            status = "ok" if not any(item["date"] in {day.isoformat() for day in missing_workdays} and item.get("reason") for item in skipped) else "partial"
+            message = f"Created {len(created)} Time Sheet Filler entries; skipped {len(skipped)} existing/failed dates."
+        else:
+            status = "exists" if existing_filler_dates else "partial"
+            message = f"Time Sheet Filler entries already exist for {', '.join(existing_filler_dates)}. No new filler entries were created." if existing_filler_dates else f"Created 0 Time Sheet Filler entries; skipped {len(skipped)}."
         return {
-            "status": "ok",
-            "message": f"Created {len(created)} Time Sheet Filler entries; skipped {len(skipped)}.",
+            "status": status,
+            "message": message,
             "created": created,
             "skipped": skipped,
-            "existingDates": [],
+            "existingDates": existing_filler_dates,
             "dailyTotals": daily_totals,
         }
     finally:
