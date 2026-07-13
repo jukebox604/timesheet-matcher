@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, runTimesheetFiller, fetchDeskTickets, type EventItem, type TeamworkProject, type TeamworkTask, type DeskTicket, type EventSource } from './timesheet'
+import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, planTimesheetFiller, createTimesheetFiller, fetchDeskTickets, type EventItem, type TeamworkProject, type TeamworkTask, type DeskTicket, type EventSource, type FillerPlanResponse } from './timesheet'
 
 interface MatchEntry {
   eventId: string
@@ -655,6 +655,7 @@ export default function Events() {
   const [actionStatus, setActionStatus] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [runningFiller, setRunningFiller] = useState(false)
+  const [fillerPlan, setFillerPlan] = useState<FillerPlanResponse | null>(null)
   const [eventSource, setEventSource] = useState<EventSource>('teamwork')
   const [loadedEventSource, setLoadedEventSource] = useState('teamwork')
   const runningFillerRef = useRef(false)
@@ -781,6 +782,7 @@ export default function Events() {
       setSelectedDeskTickets({})
       setTaskSearches({})
       setDeskTicketSearches({})
+      setFillerPlan(null)
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -798,6 +800,7 @@ export default function Events() {
     const range = workWeekFromDateInput(value)
     setStart(range.start)
     setEnd(range.end)
+    setFillerPlan(null)
   }
 
   const suggestedTaskForProject = (eventId: string, projectId: number, projectTasks: TeamworkTask[]) => {
@@ -977,17 +980,42 @@ export default function Events() {
     }
   }
 
-  const handleTimesheetFiller = async () => {
+  const handlePlanTimesheetFiller = async () => {
     if (runningFillerRef.current) {
       setActionStatus('Time Sheet Filler is already running. Ignoring duplicate click.')
       return
     }
     runningFillerRef.current = true
     setRunningFiller(true)
-    setActionStatus('Creating timesheet filler entries…')
+    setActionStatus('Planning 40h filler entries…')
     try {
-      const result = await runTimesheetFiller(start, end)
-      setActionStatus(result.message || `Timesheet filler: created ${result.created.length}; skipped ${result.skipped.length}.`)
+      const result = await planTimesheetFiller(start, end)
+      setFillerPlan(result)
+      setActionStatus(result.message || `Planned ${result.plan.length} filler entries.`)
+    } catch (e) {
+      setActionStatus((e as Error).message)
+    } finally {
+      runningFillerRef.current = false
+      setRunningFiller(false)
+    }
+  }
+
+  const handleCreateApprovedFiller = async () => {
+    if (!fillerPlan?.plan.length) {
+      setActionStatus('No filler plan to approve. Click Plan 40h Fill first.')
+      return
+    }
+    if (runningFillerRef.current) {
+      setActionStatus('Time Sheet Filler is already running. Ignoring duplicate click.')
+      return
+    }
+    runningFillerRef.current = true
+    setRunningFiller(true)
+    setActionStatus('Creating approved filler entries…')
+    try {
+      const result = await createTimesheetFiller(start, end, fillerPlan.plan)
+      setActionStatus(result.message || `Created ${result.created.length}; skipped ${result.skipped.length}.`)
+      setFillerPlan(null)
       await handleLoad()
     } catch (e) {
       setActionStatus((e as Error).message)
@@ -995,6 +1023,11 @@ export default function Events() {
       runningFillerRef.current = false
       setRunningFiller(false)
     }
+  }
+
+  const handleCancelFillerPlan = () => {
+    setFillerPlan(null)
+    setActionStatus('Filler plan cancelled. No Teamwork entries were created.')
   }
 
   const isMatched = useCallback((ev: EventItem) => {
@@ -1101,8 +1134,8 @@ export default function Events() {
             <option value="unmatched">Unmatched ({events.length - matchedCount})</option>
           </select>
         </div>
-        <button className="btn btn-warning load-events-btn" onClick={handleTimesheetFiller} disabled={runningFiller || loading}>
-          {runningFiller ? 'Running…' : 'Time Sheet Filler'}
+        <button className="btn btn-warning load-events-btn" onClick={handlePlanTimesheetFiller} disabled={runningFiller || loading}>
+          {runningFiller ? 'Working…' : 'Plan 40h Fill'}
         </button>
         <button className="btn btn-primary load-events-btn" onClick={handleSubmitMatched} disabled={submitting || loading}>
           {submitting ? 'Submitting…' : 'Submit Matched'}
@@ -1132,6 +1165,57 @@ export default function Events() {
 
       {error && <p className="error-text">{error}</p>}
       {actionStatus && <p className="action-status-text">{actionStatus}</p>}
+
+      {fillerPlan && (
+        <div className="filler-plan-card">
+          <div className="filler-plan-header">
+            <div>
+              <span className="week-progress-label">Proposed 40h filler plan</span>
+              <strong>{formatHours(fillerPlan.plannedMinutes)} planned · projected {formatHours(fillerPlan.projectedWeeklyMinutes)} / 40.0h</strong>
+              <small className="week-progress-detail">Task {fillerPlan.fillerTaskId} · {formatHours(fillerPlan.weeklyCurrentMinutes)} currently logged · {formatHours(fillerPlan.weeklyRemainingMinutes)} short before filler</small>
+            </div>
+            <div className="filler-plan-actions">
+              <button className="btn btn-primary btn-small" onClick={handleCreateApprovedFiller} disabled={runningFiller || fillerPlan.plan.length === 0}>
+                Create Proposed Fillers
+              </button>
+              <button className="btn btn-secondary btn-small" onClick={handleCancelFillerPlan} disabled={runningFiller}>
+                Cancel
+              </button>
+            </div>
+          </div>
+          {fillerPlan.plan.length > 0 ? (
+            <div className="filler-plan-table-wrap">
+              <table className="filler-plan-table">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Filler</th>
+                    <th>Time</th>
+                    <th>Task</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {fillerPlan.plan.map((item, index) => (
+                    <tr key={`${item.date}-${item.description}-${index}`}>
+                      <td>{item.date}</td>
+                      <td>{item.description}</td>
+                      <td>{formatHours(item.minutes)}</td>
+                      <td>{item.taskId}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="week-progress-detail">No filler entries are needed for this week.</p>
+          )}
+          {fillerPlan.skipped.length > 0 && (
+            <small className="week-progress-warning">
+              Skipped {fillerPlan.skipped.length} existing filler category/date pair{fillerPlan.skipped.length === 1 ? '' : 's'}.
+            </small>
+          )}
+        </div>
+      )}
 
       <div className="status-text">
         Showing {filtered.length} of {statusFiltered.length} visible events · {events.length} total · {matchedCount} matched · {events.length - matchedCount} unmatched

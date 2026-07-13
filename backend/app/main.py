@@ -1098,8 +1098,125 @@ def submit_matched(payload: dict[str, Any]) -> dict[str, object]:
     return {"status": "ok" if not errors else "partial", "created": created, "skipped": skipped, "errors": errors}
 
 
-@app.post("/api/teamwork/timesheet-filler")
-def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
+def _filler_workdays(start: str, end: str) -> tuple[date, date, list[date]]:
+    try:
+        start_date = _parse_date(start).date()
+        end_date = _parse_date(end).date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="start/end must be YYYY-MM-DD")
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="end must be on or after start")
+    workdays: list[date] = []
+    cursor = start_date
+    while cursor <= end_date:
+        if cursor.weekday() < 5:
+            workdays.append(cursor)
+        cursor += timedelta(days=1)
+    return start_date, end_date, workdays
+
+
+def _build_timesheet_filler_plan(client: TeamworkClient, start: str, end: str, user_id: str) -> dict[str, object]:
+    start_date, end_date, workdays = _filler_workdays(start, end)
+    existing_end = (end_date + timedelta(days=1)).isoformat()
+    existing = _existing_timelogs(client, start, existing_end, user_id)
+    totals_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
+    daily_totals = ((totals_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(totals_payload, dict) else {}
+    weekly_current_minutes = sum(int(daily_totals.get(day.isoformat()) or 0) for day in workdays)
+    weekly_remaining_minutes = max(WORK_WEEK_TARGET_MINUTES - weekly_current_minutes, 0)
+
+    existing_filler_dates = sorted({
+        day.isoformat()
+        for day in workdays
+        if any(_entry_matches(e, date=day.isoformat(), task_id=FILLER_TASK_ID, description=FILLER_DESCRIPTION) for e in existing)
+    })
+    existing_by_date_description = {
+        (day.isoformat(), str(category["description"]))
+        for day in workdays
+        for category in FILLER_CATEGORIES
+        if any(_entry_matches(e, date=day.isoformat(), task_id=FILLER_TASK_ID, description=str(category["description"])) for e in existing)
+    }
+
+    skipped: list[dict[str, Any]] = []
+    plan: list[dict[str, Any]] = []
+    remaining_to_fill = weekly_remaining_minutes
+    for day in workdays:
+        if remaining_to_fill <= 0:
+            break
+        date_key = day.isoformat()
+        day_logged = int(daily_totals.get(date_key) or 0)
+        day_capacity = max(WORK_DAY_TARGET_MINUTES - day_logged, 0)
+        day_to_fill = min(day_capacity, remaining_to_fill)
+        if day_to_fill <= 0:
+            continue
+        for category in FILLER_CATEGORIES:
+            if day_to_fill <= 0 or remaining_to_fill <= 0:
+                break
+            description = str(category["description"])
+            if (date_key, description) in existing_by_date_description:
+                skipped.append({"date": date_key, "description": description, "reason": "filler category already exists for this date"})
+                continue
+            minutes = min(int(category["max_minutes_per_day"]), day_to_fill, remaining_to_fill)
+            minutes = (minutes // 15) * 15
+            if minutes <= 0:
+                continue
+            plan.append({
+                "date": date_key,
+                "description": description,
+                "minutes": minutes,
+                "startTime": str(category["start_time"]),
+                "taskId": FILLER_TASK_ID,
+            })
+            day_to_fill -= minutes
+            remaining_to_fill -= minutes
+
+    planned_minutes = sum(int(item["minutes"]) for item in plan)
+    projected_weekly_minutes = weekly_current_minutes + planned_minutes
+    return {
+        "status": "planned" if plan else ("exists" if weekly_remaining_minutes <= 0 else "partial"),
+        "message": f"Planned {len(plan)} filler entries for {(planned_minutes / 60):.2f}h; projected week is {(projected_weekly_minutes / 60):.2f}h / 40.0h.",
+        "plan": plan,
+        "skipped": skipped,
+        "existingDates": existing_filler_dates,
+        "dailyTotals": daily_totals,
+        "weeklyCurrentMinutes": weekly_current_minutes,
+        "weeklyTargetMinutes": WORK_WEEK_TARGET_MINUTES,
+        "weeklyRemainingMinutes": weekly_remaining_minutes,
+        "plannedMinutes": planned_minutes,
+        "projectedWeeklyMinutes": projected_weekly_minutes,
+        "fillerTaskId": FILLER_TASK_ID,
+    }
+
+
+def _validate_approved_filler_plan(plan: Any) -> list[dict[str, Any]]:
+    if not isinstance(plan, list) or not plan:
+        raise HTTPException(status_code=400, detail="approved plan is required")
+    allowed_descriptions = {str(category["description"]) for category in FILLER_CATEGORIES}
+    approved: list[dict[str, Any]] = []
+    for item in plan:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="plan entries must be objects")
+        date_key = str(item.get("date") or "")
+        description = str(item.get("description") or "")
+        try:
+            datetime.strptime(date_key, "%Y-%m-%d")
+            minutes = int(item.get("minutes") or 0)
+            task_id = int(item.get("taskId") or 0)
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid plan entry")
+        if task_id != FILLER_TASK_ID or description not in allowed_descriptions or minutes <= 0 or minutes % 15 != 0:
+            raise HTTPException(status_code=400, detail="invalid plan entry")
+        approved.append({
+            "date": date_key,
+            "description": description,
+            "minutes": minutes,
+            "startTime": str(item.get("startTime") or FILLER_START_TIME),
+            "taskId": FILLER_TASK_ID,
+        })
+    return approved
+
+
+@app.post("/api/teamwork/timesheet-filler/plan")
+def plan_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
     teamwork_settings = get_teamwork_settings()
     if not teamwork_settings.has_credentials:
         raise HTTPException(status_code=503, detail="Teamwork is not configured")
@@ -1108,90 +1225,30 @@ def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
     end = str(payload.get("end") or "")
     if not start or not end:
         raise HTTPException(status_code=400, detail="start and end are required")
-
     client = TeamworkClient(settings=teamwork_settings)
-    try:
-        start_date = _parse_date(start).date()
-        end_date = _parse_date(end).date()
-    except Exception:
-        raise HTTPException(status_code=400, detail="start/end must be YYYY-MM-DD")
-    if end_date < start_date:
-        raise HTTPException(status_code=400, detail="end must be on or after start")
+    return _build_timesheet_filler_plan(client, start, end, str(user_id))
 
+
+@app.post("/api/teamwork/timesheet-filler/create")
+def create_approved_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
+    teamwork_settings = get_teamwork_settings()
+    if not teamwork_settings.has_credentials:
+        raise HTTPException(status_code=503, detail="Teamwork is not configured")
+    user_id = teamwork_settings.user_id or "531538"
+    start = str(payload.get("start") or "")
+    end = str(payload.get("end") or "")
+    if not start or not end:
+        raise HTTPException(status_code=400, detail="start and end are required")
+    _start_date, _end_date, workdays = _filler_workdays(start, end)
+    approved_plan = _validate_approved_filler_plan(payload.get("plan"))
+    client = TeamworkClient(settings=teamwork_settings)
     lock = _filler_lock_for(str(user_id), start, end)
     if not lock.acquire(blocking=False):
-        return {
-            "status": "running",
-            "message": "Time Sheet Filler is already running for this loaded range. No new filler entries were created.",
-            "created": [],
-            "skipped": [],
-            "existingDates": [],
-            "dailyTotals": {},
-        }
-
+        return {"status": "running", "message": "Time Sheet Filler is already running for this loaded range.", "created": [], "skipped": [], "dailyTotals": {}}
     try:
-        workdays: list[date] = []
-        cursor = start_date
-        while cursor <= end_date:
-            if cursor.weekday() < 5:
-                workdays.append(cursor)
-            cursor += timedelta(days=1)
-
-        existing_end = (end_date + timedelta(days=1)).isoformat()
-        existing = _existing_timelogs(client, start, existing_end, user_id)
-        totals_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
-        daily_totals = ((totals_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(totals_payload, dict) else {}
-        weekly_logged_minutes = sum(int(daily_totals.get(day.isoformat()) or 0) for day in workdays)
-        weekly_remaining_minutes = max(WORK_WEEK_TARGET_MINUTES - weekly_logged_minutes, 0)
-
-        existing_filler_dates = sorted({
-            day.isoformat()
-            for day in workdays
-            if any(_entry_matches(e, date=day.isoformat(), task_id=FILLER_TASK_ID, description=FILLER_DESCRIPTION) for e in existing)
-        })
-        existing_by_date_description = {
-            (day.isoformat(), str(category["description"]))
-            for day in workdays
-            for category in FILLER_CATEGORIES
-            if any(_entry_matches(e, date=day.isoformat(), task_id=FILLER_TASK_ID, description=str(category["description"])) for e in existing)
-        }
-
         created: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
-        plan: list[dict[str, Any]] = []
-        remaining_to_fill = weekly_remaining_minutes
-        for day in workdays:
-            if remaining_to_fill <= 0:
-                break
-            date_key = day.isoformat()
-            day_logged = int(daily_totals.get(date_key) or 0)
-            day_capacity = max(WORK_DAY_TARGET_MINUTES - day_logged, 0)
-            day_to_fill = min(day_capacity, remaining_to_fill)
-            if day_to_fill <= 0:
-                continue
-            for category in FILLER_CATEGORIES:
-                if day_to_fill <= 0 or remaining_to_fill <= 0:
-                    break
-                description = str(category["description"])
-                if (date_key, description) in existing_by_date_description:
-                    skipped.append({"date": date_key, "description": description, "reason": "filler category already exists for this date"})
-                    continue
-                minutes = min(int(category["max_minutes_per_day"]), day_to_fill, remaining_to_fill)
-                # Keep Teamwork entries on quarter-hour boundaries.
-                minutes = (minutes // 15) * 15
-                if minutes <= 0:
-                    continue
-                plan.append({
-                    "date": date_key,
-                    "description": description,
-                    "minutes": minutes,
-                    "startTime": str(category["start_time"]),
-                    "taskId": FILLER_TASK_ID,
-                })
-                day_to_fill -= minutes
-                remaining_to_fill -= minutes
-
-        for item in plan:
+        for item in approved_plan:
             date_key = str(item["date"])
             minutes = int(item["minutes"])
             time_entry = {
@@ -1213,21 +1270,12 @@ def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
         verified_daily_totals = ((verify_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(verify_payload, dict) else {}
         verified_weekly_minutes = sum(int(verified_daily_totals.get(day.isoformat()) or 0) for day in workdays)
         verified_remaining_minutes = max(WORK_WEEK_TARGET_MINUTES - verified_weekly_minutes, 0)
-        if created:
-            status = "ok" if verified_remaining_minutes == 0 else "partial"
-            message = f"Created {len(created)} categorized Time Sheet Filler entries using task {FILLER_TASK_ID}; week is now {(verified_weekly_minutes / 60):.2f}h / 40.0h."
-        elif weekly_remaining_minutes <= 0:
-            status = "exists"
-            message = "Week is already at or over 40.0h. No filler entries were created."
-        else:
-            status = "exists" if skipped else "partial"
-            message = f"No new filler entries were created; week remains {(verified_weekly_minutes / 60):.2f}h / 40.0h."
+        status = "ok" if created and verified_remaining_minutes == 0 else ("partial" if created else "exists")
         return {
             "status": status,
-            "message": message,
+            "message": f"Created {len(created)} approved Time Sheet Filler entries using task {FILLER_TASK_ID}; week is now {(verified_weekly_minutes / 60):.2f}h / 40.0h.",
             "created": created,
             "skipped": skipped,
-            "existingDates": existing_filler_dates,
             "dailyTotals": verified_daily_totals,
             "weeklyTargetMinutes": WORK_WEEK_TARGET_MINUTES,
             "weeklyRemainingMinutes": verified_remaining_minutes,
@@ -1235,6 +1283,11 @@ def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
         }
     finally:
         lock.release()
+
+
+@app.post("/api/teamwork/timesheet-filler")
+def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
+    raise HTTPException(status_code=400, detail="Use /api/teamwork/timesheet-filler/plan, then /api/teamwork/timesheet-filler/create with the approved plan")
 
 
 @app.post("/api/proposals/generate")

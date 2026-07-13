@@ -142,7 +142,46 @@ export async function submitMatchedEntries(entries: SubmitMatchedEntry[]): Promi
   return res.json()
 }
 
-export async function runTimesheetFiller(start: string, end: string): Promise<{ status: string; message?: string; created: unknown[]; skipped: unknown[]; existingDates?: string[]; dailyTotals: Record<string, number> }> {
-  const res = await post('/api/teamwork/timesheet-filler', { start, end })
+export interface FillerPlanItem {
+  date: string
+  description: string
+  minutes: number
+  startTime: string
+  taskId: number
+}
+
+export interface FillerPlanResponse {
+  status: string
+  message?: string
+  plan: FillerPlanItem[]
+  skipped: Array<{ date?: string; description?: string; reason?: string }>
+  existingDates?: string[]
+  dailyTotals: Record<string, number>
+  weeklyCurrentMinutes: number
+  weeklyTargetMinutes: number
+  weeklyRemainingMinutes: number
+  plannedMinutes: number
+  projectedWeeklyMinutes: number
+  fillerTaskId: number
+}
+
+export interface FillerCreateResponse {
+  status: string
+  message?: string
+  created: unknown[]
+  skipped: unknown[]
+  dailyTotals: Record<string, number>
+  weeklyTargetMinutes: number
+  weeklyRemainingMinutes: number
+  fillerTaskId: number
+}
+
+export async function planTimesheetFiller(start: string, end: string): Promise<FillerPlanResponse> {
+  const res = await post('/api/teamwork/timesheet-filler/plan', { start, end })
+  return res.json()
+}
+
+export async function createTimesheetFiller(start: string, end: string, plan: FillerPlanItem[]): Promise<FillerCreateResponse> {
+  const res = await post('/api/teamwork/timesheet-filler/create', { start, end, plan })
   return res.json()
 }

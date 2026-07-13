@@ -350,6 +350,71 @@ body {
   background: linear-gradient(90deg, var(--warning), var(--danger));
 }
 
+.filler-plan-card {
+  margin: 0 0 18px;
+  padding: 14px 16px;
+  background: rgba(129, 140, 248, 0.08);
+  border: 1px solid rgba(129, 140, 248, 0.22);
+  border-radius: 14px;
+}
+
+.filler-plan-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.filler-plan-header > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.filler-plan-header strong {
+  color: var(--text-primary);
+  font-size: 17px;
+}
+
+.filler-plan-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.filler-plan-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.filler-plan-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.filler-plan-table th,
+.filler-plan-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+
+.filler-plan-table th {
+  color: var(--text-muted);
+  background: rgba(15, 17, 23, 0.35);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.filler-plan-table tr:last-child td {
+  border-bottom: 0;
+}
+
 /* Status text */
 .status-text {
   font-size: 13px;

@@ -39,7 +39,7 @@ def install_fake(monkeypatch, daily_totals, existing_timelogs=None):
     monkeypatch.setattr(main_module, "TeamworkClient", FakeTeamworkClient)
 
 
-def test_timesheet_filler_uses_configured_task_id_and_fills_week_to_40h(monkeypatch):
+def test_timesheet_filler_plan_uses_configured_task_id_and_does_not_create(monkeypatch):
     install_fake(
         monkeypatch,
         {
@@ -52,8 +52,60 @@ def test_timesheet_filler_uses_configured_task_id_and_fills_week_to_40h(monkeypa
     )
 
     response = TestClient(app).post(
-        "/api/teamwork/timesheet-filler",
+        "/api/teamwork/timesheet-filler/plan",
         json={"start": "2026-07-06", "end": "2026-07-10"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "planned"
+    assert payload["fillerTaskId"] == FILLER_TASK_ID
+    assert payload["weeklyCurrentMinutes"] == 1575
+    assert payload["weeklyRemainingMinutes"] == 825
+    assert sum(item["minutes"] for item in payload["plan"]) == 825
+    assert payload["projectedWeeklyMinutes"] == 2400
+    assert FakeTeamworkClient.created_entries == []
+    assert {item["taskId"] for item in payload["plan"]} == {FILLER_TASK_ID}
+    assert {item["description"] for item in payload["plan"]} >= {
+        "Slack / Ticket / Jira Reviews",
+        "Email / Administration",
+        FILLER_DESCRIPTION,
+    }
+
+
+def test_timesheet_filler_create_requires_approved_plan(monkeypatch):
+    install_fake(monkeypatch, {"2026-07-06": 240})
+
+    response = TestClient(app).post(
+        "/api/teamwork/timesheet-filler/create",
+        json={"start": "2026-07-06", "end": "2026-07-06"},
+    )
+
+    assert response.status_code == 400
+    assert FakeTeamworkClient.created_entries == []
+
+
+def test_timesheet_filler_create_approved_plan_posts_to_configured_task(monkeypatch):
+    install_fake(
+        monkeypatch,
+        {
+            "2026-07-06": 240,
+            "2026-07-07": 480,
+            "2026-07-08": 480,
+            "2026-07-09": 480,
+            "2026-07-10": 480,
+        },
+    )
+    client = TestClient(app)
+    plan_response = client.post(
+        "/api/teamwork/timesheet-filler/plan",
+        json={"start": "2026-07-06", "end": "2026-07-10"},
+    )
+    plan = plan_response.json()["plan"]
+
+    response = client.post(
+        "/api/teamwork/timesheet-filler/create",
+        json={"start": "2026-07-06", "end": "2026-07-10", "plan": plan},
     )
 
     assert response.status_code == 200
@@ -61,24 +113,16 @@ def test_timesheet_filler_uses_configured_task_id_and_fills_week_to_40h(monkeypa
     assert payload["status"] == "ok"
     assert payload["fillerTaskId"] == FILLER_TASK_ID
     assert payload["weeklyRemainingMinutes"] == 0
-    assert sum(item["minutes"] for item in payload["created"]) == 825
+    assert sum(item["minutes"] for item in payload["created"]) == 240
     assert {entry["task_id"] for entry in FakeTeamworkClient.created_entries} == {FILLER_TASK_ID}
-    assert all(entry["payload"]["person-id"] == "531538" for entry in FakeTeamworkClient.created_entries)
-    assert {entry["payload"]["description"] for entry in FakeTeamworkClient.created_entries} >= {
+    assert [entry["payload"]["description"] for entry in FakeTeamworkClient.created_entries] == [
         "Slack / Ticket / Jira Reviews",
         "Email / Administration",
         FILLER_DESCRIPTION,
-    }
-    assert payload["dailyTotals"] == {
-        "2026-07-06": 480,
-        "2026-07-07": 480,
-        "2026-07-08": 480,
-        "2026-07-09": 480,
-        "2026-07-10": 480,
-    }
+    ]
 
 
-def test_timesheet_filler_skips_existing_category_for_date(monkeypatch):
+def test_timesheet_filler_plan_skips_existing_category_for_date(monkeypatch):
     install_fake(
         monkeypatch,
         {"2026-07-06": 240},
@@ -92,13 +136,13 @@ def test_timesheet_filler_skips_existing_category_for_date(monkeypatch):
     )
 
     response = TestClient(app).post(
-        "/api/teamwork/timesheet-filler",
+        "/api/teamwork/timesheet-filler/plan",
         json={"start": "2026-07-06", "end": "2026-07-06"},
     )
 
     assert response.status_code == 200
     payload = response.json()
     assert any(item["description"] == "Slack / Ticket / Jira Reviews" for item in payload["skipped"])
-    created_descriptions = [entry["payload"]["description"] for entry in FakeTeamworkClient.created_entries]
-    assert "Slack / Ticket / Jira Reviews" not in created_descriptions
-    assert created_descriptions == ["Email / Administration", FILLER_DESCRIPTION]
+    planned_descriptions = [item["description"] for item in payload["plan"]]
+    assert planned_descriptions == ["Email / Administration", FILLER_DESCRIPTION]
+    assert FakeTeamworkClient.created_entries == []
