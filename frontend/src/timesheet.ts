@@ -64,8 +64,21 @@ export async function post(path: string, body?: unknown): Promise<Response> {
   return res
 }
 
-export async function fetchEvents(start: string, end: string): Promise<{ events: EventItem[]; count: number }> {
-  return get(`/api/teamwork/events?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`)
+export type EventSource = 'teamwork' | 'google'
+
+export interface EventsResponse {
+  events: EventItem[]
+  count: number
+  query?: {
+    source?: string
+    requestedSource?: string
+    fallbackFrom?: string
+    googleCalendarError?: string
+  }
+}
+
+export async function fetchEvents(start: string, end: string, source: EventSource = 'teamwork'): Promise<EventsResponse> {
+  return get(`/api/teamwork/events?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&source=${encodeURIComponent(source)}`)
 }
 
 export interface TimesheetTotals {

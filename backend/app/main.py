@@ -755,6 +755,7 @@ def list_calendars() -> dict[str, object]:
 def get_events(
     start: str = Query(..., description="YYYY-MM-DD"),
     end: str = Query(..., description="YYYY-MM-DD"),
+    source: str = Query("teamwork", description="Event source: teamwork, google, or auto"),
 ) -> dict[str, object]:
     teamwork_settings = get_teamwork_settings()
     if not teamwork_settings.has_credentials:
@@ -762,17 +763,26 @@ def get_events(
     client = TeamworkClient(settings=teamwork_settings)
 
     all_events: list[dict[str, Any]] = []
-    event_source = "google" if google_calendar_configured() else "teamwork"
+    requested_source = source.strip().lower()
+    if requested_source not in {"teamwork", "google", "auto"}:
+        raise HTTPException(status_code=400, detail="source must be one of: teamwork, google, auto")
+
+    google_is_configured = google_calendar_configured()
+    event_source = "google" if requested_source == "google" or (requested_source == "auto" and google_is_configured) else "teamwork"
     fallback_from: str | None = None
     google_error: str | None = None
     if event_source == "google":
+        if not google_is_configured:
+            raise HTTPException(status_code=503, detail="Google Calendar is not connected")
         try:
             all_events = [_normalize_google_calendar_event(event) for event in list_google_calendar_events(start, end)]
         except Exception as exc:
-            # A saved Google token can become unusable if the OAuth project loses
-            # Calendar API access, the account revokes consent, or scopes change.
-            # Do not break the matching page; fall back to Teamwork's calendar feed
-            # and expose the fallback in the query metadata for diagnostics.
+            if requested_source != "auto":
+                raise HTTPException(status_code=502, detail=f"Failed to fetch Google Calendar events: {exc}")
+            # In auto mode, a saved Google token can become unusable if the OAuth
+            # project loses Calendar API access, the account revokes consent, or
+            # scopes change. Do not break the matching page; fall back to Teamwork's
+            # calendar feed and expose the fallback in the query metadata.
             google_error = str(exc)
             fallback_from = "google"
             event_source = "teamwork"
@@ -856,7 +866,7 @@ def get_events(
     # Sort by start_at
     all_events.sort(key=lambda e: str(e.get("start_at", "")))
 
-    query: dict[str, Any] = {"start": start, "end": end, "source": event_source}
+    query: dict[str, Any] = {"start": start, "end": end, "source": event_source, "requestedSource": requested_source}
     if fallback_from:
         query["fallbackFrom"] = fallback_from
     if google_error:

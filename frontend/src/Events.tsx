@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, runTimesheetFiller, fetchDeskTickets, type EventItem, type TeamworkProject, type TeamworkTask, type DeskTicket } from './timesheet'
+import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, runTimesheetFiller, fetchDeskTickets, type EventItem, type TeamworkProject, type TeamworkTask, type DeskTicket, type EventSource } from './timesheet'
 
 interface MatchEntry {
   eventId: string
@@ -655,6 +655,8 @@ export default function Events() {
   const [actionStatus, setActionStatus] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [runningFiller, setRunningFiller] = useState(false)
+  const [eventSource, setEventSource] = useState<EventSource>('teamwork')
+  const [loadedEventSource, setLoadedEventSource] = useState('teamwork')
   const runningFillerRef = useRef(false)
   const autoLoadedRef = useRef(false)
   const selectedWeekMonday = start
@@ -722,7 +724,7 @@ export default function Events() {
     setError('')
     try {
       const [data, dailyTotals] = await Promise.all([
-        fetchEvents(start, end),
+        fetchEvents(start, end, eventSource),
         fetchTimesheetTotals(start, end),
       ])
       const loadedEvents = data.events || []
@@ -768,6 +770,7 @@ export default function Events() {
       }
 
       setEvents(loadedEvents)
+      setLoadedEventSource(data.query?.source || eventSource)
       setWeeklyActualLoggedMinutes(loadedLoggedMinutes)
       setWeeklyLoggedMinutes(loadedCreditedMinutes)
       setWeeklyUnavailableMinutes(loadedUnavailableMinutes)
@@ -783,7 +786,7 @@ export default function Events() {
     } finally {
       setLoading(false)
     }
-  }, [end, loadDeskTicketsForProject, loadTasksForProject, start])
+  }, [end, eventSource, loadDeskTicketsForProject, loadTasksForProject, start])
 
   useEffect(() => {
     if (autoLoadedRef.current) return
@@ -1072,6 +1075,14 @@ export default function Events() {
           <label>Week of Monday</label>
           <input type="date" value={selectedWeekMonday} onChange={e => handleWeekChange(e.target.value)} />
           <span className="week-range-hint">Mon–Fri: {formatDate(start)} to {formatDate(end)}</span>
+        </div>
+        <div className="field-group source-field">
+          <label>Calendar source</label>
+          <select value={eventSource} onChange={e => setEventSource(e.target.value as EventSource)}>
+            <option value="teamwork">Teamwork Calendar</option>
+            <option value="google">Google Calendar</option>
+          </select>
+          <span className="week-range-hint">Loaded: {loadedEventSource === 'google' ? 'Google' : 'Teamwork'}</span>
         </div>
         <button className="btn btn-primary load-events-btn" onClick={handleLoad} disabled={loading}>
           {loading ? 'Loading…' : 'Load Events'}
