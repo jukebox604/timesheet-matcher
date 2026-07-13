@@ -763,12 +763,22 @@ def get_events(
 
     all_events: list[dict[str, Any]] = []
     event_source = "google" if google_calendar_configured() else "teamwork"
+    fallback_from: str | None = None
+    google_error: str | None = None
     if event_source == "google":
         try:
             all_events = [_normalize_google_calendar_event(event) for event in list_google_calendar_events(start, end)]
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Failed to fetch Google Calendar events: {exc}")
-    else:
+            # A saved Google token can become unusable if the OAuth project loses
+            # Calendar API access, the account revokes consent, or scopes change.
+            # Do not break the matching page; fall back to Teamwork's calendar feed
+            # and expose the fallback in the query metadata for diagnostics.
+            google_error = str(exc)
+            fallback_from = "google"
+            event_source = "teamwork"
+            all_events = []
+
+    if event_source == "teamwork":
         try:
             calendars = client.list_calendars()
         except Exception as exc:
@@ -846,8 +856,14 @@ def get_events(
     # Sort by start_at
     all_events.sort(key=lambda e: str(e.get("start_at", "")))
 
+    query: dict[str, Any] = {"start": start, "end": end, "source": event_source}
+    if fallback_from:
+        query["fallbackFrom"] = fallback_from
+    if google_error:
+        query["googleCalendarError"] = google_error
+
     return {
-        "query": {"start": start, "end": end, "source": event_source},
+        "query": query,
         "count": len(all_events),
         "events": all_events,
     }
