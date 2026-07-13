@@ -902,7 +902,13 @@ export default function Events() {
       return
     }
     setSelectedDeskTickets(prev => ({ ...prev, [eventId]: ticket }))
-    const linkedProjectId = ticket.projectIds?.[0]
+    const validProjectIds = new Set(projects.map(project => project.id))
+    const existingMatch = matches[eventId]
+    const event = events.find(item => item.id === eventId)
+    const suggestedProjectId = event ? suggestForEvent(event)?.projectId : null
+    const linkedProjectId = ticket.projectIds?.find(projectId => validProjectIds.has(projectId))
+      || (existingMatch?.projectId && validProjectIds.has(existingMatch.projectId) ? existingMatch.projectId : null)
+      || (suggestedProjectId && validProjectIds.has(suggestedProjectId) ? suggestedProjectId : null)
     if (linkedProjectId) {
       const [projectTasks] = await Promise.all([
         loadTasksForProject(linkedProjectId),

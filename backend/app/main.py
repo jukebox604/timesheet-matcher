@@ -46,6 +46,7 @@ FILLER_LOCKS_GUARD = Lock()
 # available. Extend as we confirm more customers.
 DESK_COMPANY_ID_BY_PROJECT_COMPANY_NAME = {
     "wencor": 29740,
+    "stratas": 29837,
 }
 
 # Teamwork calendar mappings can point at a generic/customer task while the actual
@@ -895,9 +896,27 @@ def _desk_company_id_for_project(project: dict[str, Any]) -> int | None:
 
 
 def _project_ids_from_desk_ticket(ticket: dict[str, Any]) -> list[int]:
+    """Return Teamwork Projects project IDs explicitly linked from Desk data.
+
+    Desk thread `taskId` values are Desk/Projects task identifiers, not project
+    IDs. Treating them as project IDs makes the frontend select an invisible
+    project and leaves Match disabled.
+    """
     project_ids: list[int] = []
+    candidates: list[Any] = [
+        ticket.get("projectId"),
+        ticket.get("project-id"),
+        (ticket.get("project") or {}).get("id") if isinstance(ticket.get("project"), dict) else None,
+    ]
     for thread in ticket.get("threads") or []:
-        raw_id = thread.get("taskId")
+        if not isinstance(thread, dict):
+            continue
+        candidates.extend([
+            thread.get("projectId"),
+            thread.get("project-id"),
+            (thread.get("project") or {}).get("id") if isinstance(thread.get("project"), dict) else None,
+        ])
+    for raw_id in candidates:
         if raw_id is None:
             continue
         try:
