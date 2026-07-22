@@ -1,4 +1,5 @@
 from datetime import datetime, timezone, timedelta, date
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import html
 import re
 from pathlib import Path
@@ -44,9 +45,22 @@ FILLER_MINUTES = 30
 FILLER_BILLABLE = "0"
 WORK_WEEK_TARGET_MINUTES = 40 * 60
 WORK_DAY_TARGET_MINUTES = 8 * 60
+MAX_MATCHED_ENTRY_MINUTES = 24 * 60
 FILLER_TIMEZONE = ZoneInfo("America/Vancouver")
 FILLER_LOCKS: dict[str, Lock] = {}
 FILLER_LOCKS_GUARD = Lock()
+
+
+def _round_to_quarter_hour(minutes: Any) -> int:
+    """Round a duration to the nearest 15 minutes, with halfway ties up."""
+    try:
+        duration = Decimal(str(minutes or 0))
+        if not duration.is_finite() or duration <= 0 or duration > MAX_MATCHED_ENTRY_MINUTES:
+            return 0
+        quarter_hours = (duration / Decimal(15)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        return max(15, int(quarter_hours * 15))
+    except (InvalidOperation, OverflowError, TypeError, ValueError):
+        return 0
 
 # Desk and Projects company IDs live in different Teamwork namespaces. Keep this
 # as an explicit bridge table and prefer linked project IDs from Desk threads when
@@ -517,7 +531,7 @@ def _calendar_timelog_payload(entry: dict[str, Any]) -> dict[str, Any]:
         "date": date,
         "time": time,
         "hasStartTime": True,
-        "minutes": int(entry.get("minutes") or entry.get("duration_minutes") or 0),
+        "minutes": _round_to_quarter_hour(entry.get("minutes") or entry.get("duration_minutes") or 0),
         "description": str(entry.get("description") or f"Event: {entry.get('title', '')}"),
         "projectId": int(entry["projectId"]),
         "taskId": int(entry["taskId"]),
