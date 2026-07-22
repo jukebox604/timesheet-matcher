@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, planTimesheetFiller, createTimesheetFiller, fetchDeskTickets, type EventItem, type TeamworkProject, type TeamworkTask, type DeskTicket, type EventSource, type FillerPlanResponse } from './timesheet'
+import { roundToQuarterHour } from './timeRounding.js'
 
 interface MatchEntry {
   eventId: string
@@ -954,7 +955,7 @@ export default function Events() {
           title: ev.title,
           description: descriptionWithDeskTicket(ev, deskTicket),
           start: ev.start,
-          duration_minutes: ev.duration_minutes,
+          duration_minutes: roundToQuarterHour(ev.duration_minutes),
           projectId: Number(match!.projectId),
           taskId: Number(match!.taskId),
           mappedTaskIds: ev.mappedTaskIds,
@@ -1036,7 +1037,7 @@ export default function Events() {
   }, [confirmedMatches])
 
   const matchedCount = events.filter(isMatched).length
-  const importedEventMinutes = events.reduce((total, ev) => total + (ev.duration_minutes || 0), 0)
+  const importedEventMinutes = events.reduce((total, ev) => total + roundToQuarterHour(ev.duration_minutes), 0)
   const weeklyRemainingMinutes = Math.max(WORK_WEEK_TARGET_MINUTES - weeklyLoggedMinutes, 0)
   const weeklyOverageMinutes = Math.max(weeklyLoggedMinutes - WORK_WEEK_TARGET_MINUTES, 0)
   const weeklyProgressPercent = Math.min((weeklyLoggedMinutes / WORK_WEEK_TARGET_MINUTES) * 100, 100)
@@ -1058,11 +1059,10 @@ export default function Events() {
 
   const formatDuration = (minutes?: number) => {
     if (!minutes) return '0h'
-    const h = minutes / 60
-    return `${h.toFixed(1)}h`
+    return `${Number((minutes / 60).toFixed(2))}h`
   }
 
-  const formatHours = (minutes: number) => `${(minutes / 60).toFixed(1)}h`
+  const formatHours = (minutes: number) => `${Number((minutes / 60).toFixed(2))}h`
 
   const formatDate = (startStr?: string) => {
     if (!startStr) return ''
@@ -1277,6 +1277,8 @@ export default function Events() {
           const projectDeskTickets = deskTicketsForProject(selectedProject, deskTicketSearch)
           const deskMatches = selectedProject ? projectDeskTickets : relatedDeskTickets(ev, deskTickets).map(({ ticket }) => ticket)
           const selectedDeskTicket = selectedDeskTickets[ev.id]
+          const originalDurationMinutes = ev.duration_minutes || 0
+          const roundedDurationMinutes = roundToQuarterHour(originalDurationMinutes)
           const deskTicketOptions = selectedDeskTicket && !deskMatches.some(ticket => ticket.id === selectedDeskTicket.id)
             ? [selectedDeskTicket, ...deskMatches]
             : deskMatches
@@ -1292,7 +1294,8 @@ export default function Events() {
                   </span>
                 </div>
                 <div className="event-time">
-                  {formatDate(eventStartValue(ev))} · {formatDuration(ev.duration_minutes)}
+                  {formatDate(eventStartValue(ev))} · {formatDuration(roundedDurationMinutes)}
+                  {roundedDurationMinutes !== originalDurationMinutes ? ` (rounded from ${formatDuration(originalDurationMinutes)})` : ''}
                   {ev._calendar_name ? ` · ${ev._calendar_name}` : ''}
                 </div>
                 <p className="event-description">{cleanDescription(ev.description)}</p>
