@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, planTimesheetFiller, createTimesheetFiller, fetchDeskTickets, type EventItem, type TeamworkProject, type TeamworkTask, type DeskTicket, type EventSource, type FillerPlanResponse } from './timesheet'
+import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, planTimesheetFiller, createTimesheetFiller, fetchDeskTickets, type EventItem, type TeamworkProject, type TeamworkTask, type DeskTicket, type EventSource, type FillerPlanResponse, type FillerPlanItem } from './timesheet'
 import { descriptionWithAttendees } from './attendeeDetails'
 import { matchProjectPrefix } from './projectPrefixMatch.js'
 import { roundToQuarterHour } from './timeRounding.js'
@@ -1005,8 +1005,8 @@ export default function Events() {
     }
   }
 
-  const handleCreateApprovedFiller = async () => {
-    if (!fillerPlan?.plan.length) {
+  const handleCreateApprovedFiller = async (items: FillerPlanItem[]) => {
+    if (!fillerPlan?.plan.length || !items.length) {
       setActionStatus('No filler plan to approve. Click Plan 40h Fill first.')
       return
     }
@@ -1016,14 +1016,34 @@ export default function Events() {
     }
     runningFillerRef.current = true
     setRunningFiller(true)
-    setActionStatus('Creating approved filler entries…')
+    setActionStatus(`Submitting ${items.length} approved filler ${items.length === 1 ? 'entry' : 'entries'}…`)
     try {
-      const result = await createTimesheetFiller(start, end, fillerPlan.plan)
-      setActionStatus(result.message || `Created ${result.created.length}; skipped ${result.skipped.length}.`)
-      setFillerPlan(null)
-      await handleLoad()
+      const result = await createTimesheetFiller(start, end, items)
+      const summary = `Created ${result.created.length}; skipped ${result.skipped.length}.`
+      if (result.status === 'running') {
+        setActionStatus(result.message || summary)
+        return
+      }
+      // Replan from live Teamwork data after each individual or bulk submission.
+      // Remaining suggestions and the weekly progress must not use stale totals.
+      try {
+        const [nextPlan, totals] = await Promise.all([
+          planTimesheetFiller(start, end),
+          fetchTimesheetTotals(start, end),
+        ])
+        setFillerPlan(nextPlan)
+        setWeeklyActualLoggedMinutes(Object.values(totals.dailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0))
+        setWeeklyLoggedMinutes(Object.values(totals.creditedDailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0))
+        setWeeklyUnavailableMinutes(Object.values(totals.unavailableDailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0))
+        setWeeklyPersonalCommitmentMinutes(Object.values(totals.personalCommitmentUnloggedDailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0))
+        setActionStatus(`${summary}${result.skipped.length ? ' Some proposals changed; review the refreshed plan.' : ''}`)
+      } catch {
+        setFillerPlan(null)
+        setActionStatus(`${summary} Could not refresh recommendations; click Plan 40h Fill before submitting more.`)
+      }
     } catch (e) {
-      setActionStatus((e as Error).message)
+      setFillerPlan(null)
+      setActionStatus(`Submission could not be confirmed: ${(e as Error).message}. Click Plan 40h Fill before retrying.`)
     } finally {
       runningFillerRef.current = false
       setRunningFiller(false)
@@ -1032,7 +1052,7 @@ export default function Events() {
 
   const handleCancelFillerPlan = () => {
     setFillerPlan(null)
-    setActionStatus('Filler plan cancelled. No Teamwork entries were created.')
+    setActionStatus('Remaining filler proposals dismissed. Any previously submitted entries are unchanged.')
   }
 
   const isMatched = useCallback((ev: EventItem) => {
@@ -1116,7 +1136,7 @@ export default function Events() {
       <div className="controls-row matching-controls">
         <div className="field-group week-field">
           <label>Week of Monday</label>
-          <input type="date" value={selectedWeekMonday} onChange={e => handleWeekChange(e.target.value)} />
+          <input type="date" value={selectedWeekMonday} onChange={e => handleWeekChange(e.target.value)} disabled={runningFiller} />
           <span className="week-range-hint">Mon–Fri: {formatDate(start)} to {formatDate(end)}</span>
         </div>
         <div className="field-group source-field">
@@ -1127,7 +1147,7 @@ export default function Events() {
           </select>
           <span className="week-range-hint">Loaded: {loadedEventSource === 'google' ? 'Google' : 'Teamwork'}</span>
         </div>
-        <button className="btn btn-primary load-events-btn" onClick={handleLoad} disabled={loading}>
+        <button className="btn btn-primary load-events-btn" onClick={handleLoad} disabled={loading || runningFiller}>
           {loading ? 'Loading…' : 'Load Events'}
         </button>
         <div className="field-group filter-field">
@@ -1179,8 +1199,8 @@ export default function Events() {
               <small className="week-progress-detail">Task {fillerPlan.fillerTaskId} · {formatHours(fillerPlan.weeklyCurrentMinutes)} credited logged + unavailable · {formatHours(fillerPlan.weeklyRemainingMinutes)} short before filler</small>
             </div>
             <div className="filler-plan-actions">
-              <button className="btn btn-primary btn-small" onClick={handleCreateApprovedFiller} disabled={runningFiller || fillerPlan.plan.length === 0}>
-                Create Proposed Fillers
+              <button className="btn btn-primary btn-small" onClick={() => void handleCreateApprovedFiller(fillerPlan.plan)} disabled={runningFiller || loading || fillerPlan.plan.length === 0}>
+                Submit All Recommended Fillers
               </button>
               <button className="btn btn-secondary btn-small" onClick={handleCancelFillerPlan} disabled={runningFiller}>
                 Cancel
@@ -1196,6 +1216,7 @@ export default function Events() {
                     <th>Filler</th>
                     <th>Time</th>
                     <th>Task</th>
+                    <th>Action</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1205,6 +1226,11 @@ export default function Events() {
                       <td>{item.description}</td>
                       <td>{formatHours(item.minutes)}</td>
                       <td>{item.taskId}</td>
+                      <td>
+                        <button type="button" className="btn btn-primary btn-small" onClick={() => void handleCreateApprovedFiller([item])} disabled={runningFiller || loading} aria-label={`Submit filler for ${item.date}: ${item.description}`}>
+                          {runningFiller ? 'Working…' : 'Submit Entry'}
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>

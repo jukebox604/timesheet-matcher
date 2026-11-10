@@ -4,7 +4,7 @@ import html
 import re
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -1329,11 +1329,24 @@ def create_approved_timesheet_filler(payload: dict[str, Any]) -> dict[str, objec
     if not lock.acquire(blocking=False):
         return {"status": "running", "message": "Time Sheet Filler is already running for this loaded range.", "created": [], "skipped": [], "dailyTotals": {}}
     try:
+        # An approved row may be sent on its own or as part of the full plan.
+        # Compare against current Teamwork data so stale/replayed rows cannot
+        # duplicate a category or push a day/week beyond its planned capacity.
+        current_plan = _build_timesheet_filler_plan(client, start, end, str(user_id))
+        available_rows = {
+            (item["date"], item["description"], item["minutes"], item["startTime"], item["taskId"])
+            for item in cast(list[dict[str, Any]], current_plan["plan"])
+        }
         created: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         for item in approved_plan:
             date_key = str(item["date"])
             minutes = int(item["minutes"])
+            row_key = (date_key, item["description"], minutes, item["startTime"], item["taskId"])
+            if row_key not in available_rows:
+                skipped.append({"date": date_key, "description": item["description"], "minutes": minutes, "reason": "Filler proposal is no longer current; plan again before submitting."})
+                continue
+            available_rows.remove(row_key)
             time_entry = {
                 "description": str(item["description"]),
                 "person-id": str(user_id),
