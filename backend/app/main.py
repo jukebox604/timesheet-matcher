@@ -103,6 +103,9 @@ def _clean_event_description(description: str | None) -> str:
     text = html.unescape(text)
     for boilerplate in RECLAIM_DESCRIPTION_BOILERPLATE:
         text = text.replace(boilerplate, " ")
+    # Reclaim task completion notes begin at a standalone tilde divider.
+    # Keep the real task details above it, but never submit the reminder below.
+    text = re.split(r"(?m)^[ \t]*~{4,}[ \t]*(?:\n|$)", text, maxsplit=1)[0]
     # Reclaim Booking Page descriptions contain conferencing links, a passcode,
     # and cancellation instructions around the actual meeting notes. Only use
     # the footer as a cutoff when a preceding Meeting notes/details section exists.
@@ -118,6 +121,33 @@ def _clean_event_description(description: str | None) -> str:
         note_body = text[notes.end():footer.start()].strip()
         if note_body:
             text = f"Meeting {notes.group(1).lower()}: {note_body}"
+    # Drop conferencing instructions, not the agenda before or after them.
+    # The two long Teams rules delimit its block; the shorter internal rule
+    # between passcode and phone details must not end the match early.
+    text = re.sub(
+        r"(?ims)^[ \t]*_{40,}[ \t]*\n[ \t]*Microsoft Teams meeting[ \t]*\n"
+        r".*?^[ \t]*_{40,}[ \t]*(?:\n|$)",
+        "", text,
+    )
+    text = re.sub(
+        r"(?ims)^[ \t]*Microsoft Teams meeting[ \t]*\n.*?"
+        r"^[ \t]*For organizers:[^\n]*(?:\n[ \t]*_{10,}[ \t]*)?(?:\n|$)",
+        "", text,
+    )
+    text = re.sub(
+        r"(?ims)^[ \t]*Join Zoom Meeting[ \t]*\n.*?"
+        r"^[ \t]*Find your local number:[^\n]*(?:\n|$)",
+        "", text,
+    )
+    # Zoom's newer invitation format uses Unicode rules and ends with a
+    # "Join instructions" link rather than "Find your local number".
+    text = re.sub(
+        r"(?ims)^[ \t]*[─━]{8,}[ \t]*\n(?:[ \t]*\n)*"
+        r"[^\n]*is inviting you to a scheduled Zoom meeting\.[ \t]*\n.*?"
+        r"^[ \t]*Join instructions[ \t]*\n[ \t]*https?://[^\n]*"
+        r"(?:\n(?:[ \t]*\n)*[ \t]*[─━]{8,}[ \t]*)?(?:\n|$)",
+        "", text,
+    )
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
