@@ -103,6 +103,21 @@ def _clean_event_description(description: str | None) -> str:
     text = html.unescape(text)
     for boilerplate in RECLAIM_DESCRIPTION_BOILERPLATE:
         text = text.replace(boilerplate, " ")
+    # Reclaim Booking Page descriptions contain conferencing links, a passcode,
+    # and cancellation instructions around the actual meeting notes. Only use
+    # the footer as a cutoff when a preceding Meeting notes/details section exists.
+    notes = re.search(r"\bMeeting\s+(notes|details)\s*:", text, flags=re.IGNORECASE)
+    footer = re.search(
+        r"Want\s+to\s+make\s+changes\s+to\s+this\s+event\?\s*You\s+can\s+edit\s+"
+        r"the\s+event\s+directly\s+or\s+use\s+the\s+links\s+below\s+to\s+cancel\s+"
+        r"or\s+reschedule\.?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if notes and footer and notes.end() < footer.start():
+        note_body = text[notes.end():footer.start()].strip()
+        if note_body:
+            text = f"Meeting {notes.group(1).lower()}: {note_body}"
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
