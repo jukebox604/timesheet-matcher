@@ -8,6 +8,7 @@ from google.auth.transport import requests as google_requests
 
 from app.config import settings
 from app.deps import create_token, get_optional_user
+from app.google_calendar import save_google_calendar_tokens
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -24,10 +25,10 @@ def google_login(state: str | None = Query(default=None)):
         "client_id": settings.google_client_id,
         "redirect_uri": settings.google_redirect_uri,
         "response_type": "code",
-        "scope": "openid email profile",
+        "scope": "openid email profile https://www.googleapis.com/auth/calendar.readonly",
         "state": state,
-        "access_type": "online",
-        "prompt": "select_account",
+        "access_type": "offline",
+        "prompt": "consent select_account",
     }
     auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
     return RedirectResponse(url=auth_url)
@@ -72,6 +73,7 @@ async def google_callback(
         raise HTTPException(status_code=400, detail=f"Token verification failed: {e}")
 
     user_info = {"sub": info.get("sub"), "email": info.get("email", ""), "name": info.get("name", ""), "picture": info.get("picture", "")}
+    save_google_calendar_tokens(tokens, user_info)
     jwt_token = create_token(user_info)
     return RedirectResponse(url=f"/?token={jwt_token}", status_code=302)
 

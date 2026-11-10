@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import Events from './Events'
 import './styles.css'
 
 interface UserInfo {
@@ -29,20 +30,16 @@ export default function App() {
   const [user, setUser] = useState<UserInfo | null>(null)
 
   useEffect(() => {
-    // Check URL for token parameter
     const params = new URLSearchParams(window.location.search)
     const urlToken = params.get('token')
 
     if (urlToken) {
-      // Store token, clean URL, and set user
       localStorage.setItem('auth_token', urlToken)
       const parsed = parseJwt(urlToken)
       setUser(parsed)
       setToken(urlToken)
-      // Clean the URL without token param, using replace to avoid history entry
       window.history.replaceState({}, document.title, window.location.pathname)
     } else {
-      // Try to load from localStorage
       const storedToken = localStorage.getItem('auth_token')
       if (storedToken) {
         const parsed = parseJwt(storedToken)
@@ -50,7 +47,6 @@ export default function App() {
           setUser(parsed)
           setToken(storedToken)
         } else {
-          // Invalid token, clear it
           localStorage.removeItem('auth_token')
         }
       }
@@ -63,36 +59,18 @@ export default function App() {
     setUser(null)
   }
 
-  // Authenticated — show Coming Soon page
   if (token && user) {
     return (
       <div className="app-shell">
-        <nav className="nav-bar">
-          <div className="nav-title">Timesheet</div>
-          <button className="logout-btn" onClick={handleLogout}>Sign Out</button>
+        <nav className="nav-bar app-nav-single">
+          <div className="nav-brand">Timesheet Matcher</div>
+          <button className="logout-btn" onClick={handleLogout}>Logout</button>
         </nav>
-        <div className="coming-soon-container">
-          <div className="card coming-soon-card">
-            <div className="user-avatar">
-              {user.picture ? (
-                <img src={user.picture} alt={user.name} className="avatar-img" />
-              ) : (
-                <div className="avatar-fallback">{user.name?.charAt(0) || '?'}</div>
-              )}
-            </div>
-            <h1 className="coming-soon-title">Coming Soon</h1>
-            <p className="coming-soon-subtitle">Something great is in the works</p>
-            <div className="user-info">
-              <span className="user-name">{user.name}</span>
-              <span className="user-email">{user.email}</span>
-            </div>
-          </div>
-        </div>
+        <Events />
       </div>
     )
   }
 
-  // Not authenticated — show Google Sign-In
   return (
     <div className="app-shell">
       <div className="login-container">

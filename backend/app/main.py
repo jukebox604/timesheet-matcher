@@ -1,8 +1,13 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import html
+import re
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, cast
+from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -11,6 +16,709 @@ from app.teamwork import TeamworkClient, get_teamwork_settings, teamwork_status_
 from app.models import init_db, insert_proposal
 from app.matcher import match_and_propose
 from app.auth import router as auth_router
+from app.google_calendar import list_google_calendar_events, google_calendar_configured
+
+EXCLUDED_MATCHING_EVENT_TITLES = (
+    "am email review",
+    "pm email review",
+    "decompress",
+    "personal commitment",
+    "out of office",
+)
+PERSONAL_COMMITMENT_TITLE = "personal commitment"
+RECLAIM_DESCRIPTION_BOILERPLATE = (
+    "This event was created by Reclaim.",
+    "Only you can see this Task's event details. It will show as busy to others and automatically reschedule if booked over.",
+)
+
+FILLER_PROJECT_ID = 417162
+FILLER_TASK_ID = 29936460
+FILLER_DESCRIPTION = "Teamwork, Teamdesk, Slack, Email and Jira"
+FILLER_CATEGORIES = (
+    {"key": "slack_ticket_jira", "description": "Slack / Ticket / Jira Reviews", "max_minutes_per_day": 120, "start_time": "17:00"},
+    {"key": "email_admin", "description": "Email / Administration", "max_minutes_per_day": 60, "start_time": "19:00"},
+    {"key": "general_admin", "description": FILLER_DESCRIPTION, "max_minutes_per_day": 120, "start_time": "20:00"},
+)
+FILLER_START_TIME = "20:00"
+FILLER_HOURS = 1
+FILLER_MINUTES = 30
+FILLER_BILLABLE = "0"
+WORK_WEEK_TARGET_MINUTES = 40 * 60
+WORK_DAY_TARGET_MINUTES = 8 * 60
+MAX_MATCHED_ENTRY_MINUTES = 24 * 60
+FILLER_TIMEZONE = ZoneInfo("America/Vancouver")
+FILLER_LOCKS: dict[str, Lock] = {}
+FILLER_LOCKS_GUARD = Lock()
+
+
+def _round_to_quarter_hour(minutes: Any) -> int:
+    """Round a duration to the nearest 15 minutes, with halfway ties up."""
+    try:
+        duration = Decimal(str(minutes or 0))
+        if not duration.is_finite() or duration <= 0 or duration > MAX_MATCHED_ENTRY_MINUTES:
+            return 0
+        quarter_hours = (duration / Decimal(15)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        return max(15, int(quarter_hours * 15))
+    except (InvalidOperation, OverflowError, TypeError, ValueError):
+        return 0
+
+# Desk and Projects company IDs live in different Teamwork namespaces. Keep this
+# as an explicit bridge table and prefer linked project IDs from Desk threads when
+# available. Extend as we confirm more customers.
+DESK_COMPANY_ID_BY_PROJECT_COMPANY_NAME = {
+    "wencor": 29740,
+    "stratas": 29837,
+}
+
+# Teamwork calendar mappings can point at a generic/customer task while the actual
+# logged meeting time is posted to a meeting task in the same project. Keep this
+# explicit and small; expand only when verified from live data.
+KNOWN_MEETING_TASK_IDS = {32199677}
+
+
+def _is_excluded_matching_event(event: dict[str, Any]) -> bool:
+    title = str(event.get("title") or event.get("summary") or "").lower()
+    return any(excluded in title for excluded in EXCLUDED_MATCHING_EVENT_TITLES)
+
+
+def _is_personal_commitment_event(event: dict[str, Any]) -> bool:
+    title = str(event.get("title") or event.get("summary") or "").lower()
+    return PERSONAL_COMMITMENT_TITLE in title
+
+
+def _clean_event_description(description: str | None) -> str:
+    text = str(description or "")
+    if not text:
+        return ""
+    # Remove Reclaim boilerplate before and after tag stripping; the word "Reclaim"
+    # is often wrapped in a link, so exact plain-text matching only works after cleanup.
+    text = re.sub(r"(?is)<i>\s*This event was created by\s*<a\b[^>]*>\s*Reclaim\s*</a>\s*\.\s*</i>", " ", text)
+    text = re.sub(r"(?is)Only you can see this Task's event details\.\s*It will show as busy to others and automatically reschedule if booked over\.", " ", text)
+    # Preserve meaningful structure before stripping HTML from Teamwork/Google/Reclaim descriptions.
+    text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", text)
+    text = re.sub(r"(?i)</\s*(p|div|li|tr|h[1-6])\s*>", "\n", text)
+    text = re.sub(r"(?i)<\s*li\b[^>]*>", "\n• ", text)
+    text = re.sub(r"(?i)<\s*/?\s*(ul|ol|table|tbody|thead)\b[^>]*>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    for boilerplate in RECLAIM_DESCRIPTION_BOILERPLATE:
+        text = text.replace(boilerplate, " ")
+    # Reclaim task completion notes begin at a standalone tilde divider.
+    # Keep the real task details above it, but never submit the reminder below.
+    text = re.split(r"(?m)^[ \t]*~{4,}[ \t]*(?:\n|$)", text, maxsplit=1)[0]
+    # Reclaim Booking Page descriptions contain conferencing links, a passcode,
+    # and cancellation instructions around the actual meeting notes. When no
+    # notes were supplied, remove the booking block rather than submitting it.
+    notes = re.search(r"\bMeeting\s+(notes|details)\s*:", text, flags=re.IGNORECASE)
+    footer = re.search(
+        r"Want\s+to\s+make\s+changes\s+to\s+this\s+event\?\s*You\s+can\s+edit\s+"
+        r"the\s+event\s+directly\s+or\s+use\s+the\s+links\s+below\s+to\s+cancel\s+"
+        r"or\s+reschedule\.?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if notes and footer and notes.end() < footer.start():
+        note_body = text[notes.end():footer.start()].strip()
+        if note_body:
+            text = f"Meeting {notes.group(1).lower()}: {note_body}"
+    if footer and re.search(r"\bEvent\s+name\s*:\s*Booking\s+Page\b", text[:footer.start()], re.IGNORECASE):
+        booking_start = re.search(r"(?im)^[ \t]*Join meeting now[ \t]*(?:\n|$)", text[:footer.start()])
+        if booking_start:
+            text = text[:booking_start.start()]
+    # Drop conferencing instructions, not the agenda before or after them.
+    # The two long Teams rules delimit its block; the shorter internal rule
+    # between passcode and phone details must not end the match early.
+    text = re.sub(
+        r"(?ims)^[ \t]*_{40,}[ \t]*\n[ \t]*Microsoft Teams meeting[ \t]*\n"
+        r".*?^[ \t]*_{40,}[ \t]*(?:\n|$)",
+        "", text,
+    )
+    text = re.sub(
+        r"(?ims)^[ \t]*Microsoft Teams meeting[ \t]*\n.*?"
+        r"^[ \t]*For organizers:[^\n]*(?:\n[ \t]*_{10,}[ \t]*)?(?:\n|$)",
+        "", text,
+    )
+    text = re.sub(
+        r"(?ims)^[ \t]*Join Zoom Meeting[ \t]*\n.*?"
+        r"^[ \t]*Find your local number:[^\n]*(?:\n|$)",
+        "", text,
+    )
+    # Zoom's newer invitation format uses Unicode rules and ends with a
+    # "Join instructions" link rather than "Find your local number".
+    text = re.sub(
+        r"(?ims)^[ \t]*[─━]{8,}[ \t]*\n(?:[ \t]*\n)*"
+        r"[^\n]*is inviting you to a scheduled Zoom meeting\.[ \t]*\n.*?"
+        r"^[ \t]*Join instructions[ \t]*\n[ \t]*https?://[^\n]*"
+        r"(?:\n(?:[ \t]*\n)*[ \t]*[─━]{8,}[ \t]*)?(?:\n|$)",
+        "", text,
+    )
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _normalize_google_calendar_event(event: dict[str, Any]) -> dict[str, Any]:
+    start = event.get("start") or {}
+    end = event.get("end") or {}
+    start_at = start.get("dateTime") or start.get("date") or "" if isinstance(start, dict) else str(start or "")
+    end_at = end.get("dateTime") or end.get("date") or "" if isinstance(end, dict) else str(end or "")
+    all_day = isinstance(start, dict) and bool(start.get("date")) and not start.get("dateTime")
+    normalized = {
+        **event,
+        "id": f"google:{event.get('id', '')}",
+        "googleEventId": event.get("id"),
+        "source": "google",
+        "calendarId": "google",
+        "_calendar_name": "Doppio Google Calendar",
+        "title": event.get("summary") or event.get("title") or "Untitled event",
+        "description": _clean_event_description(event.get("description")),
+        "start": start_at,
+        "end": end_at,
+        "start_at": start_at,
+        "end_at": end_at,
+        "allDay": all_day,
+        "attendees": event.get("attendees") or [],
+        "mappedTaskIds": [],
+    }
+    if normalized.get("duration_minutes") is None and start_at and end_at and not all_day:
+        try:
+            s = datetime.fromisoformat(str(start_at).replace("Z", "+00:00"))
+            e = datetime.fromisoformat(str(end_at).replace("Z", "+00:00"))
+            normalized["duration_minutes"] = int((e - s).total_seconds() / 60)
+        except Exception:
+            normalized["duration_minutes"] = 0
+    elif all_day:
+        normalized["duration_minutes"] = 480
+    return normalized
+
+
+def _event_datetime_value(event: dict[str, Any], key: str) -> str:
+    raw = event.get(key) or event.get(f"{key}Date") or event.get(f"{key}_at") or ""
+    if isinstance(raw, dict):
+        raw = raw.get("dateTime") or raw.get("date") or ""
+    return str(raw or "")
+
+
+def _parse_event_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=FILLER_TIMEZONE)
+        return parsed
+    except Exception:
+        return None
+
+
+def _event_local_date(event: dict[str, Any]) -> str:
+    parsed = _parse_event_datetime(_event_datetime_value(event, "start"))
+    if not parsed:
+        return ""
+    return parsed.astimezone(FILLER_TIMEZONE).date().isoformat()
+
+
+def _parse_date(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%d")
+
+
+def _entry_date(entry: dict[str, Any]) -> str:
+    raw = entry.get("date") or ""
+    value = str(raw)[:10].replace("/", "-")
+    if len(value) == 8 and value.isdigit():
+        return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
+    if value:
+        return value
+
+    # Teamwork v3 timelogs often omit `date` and only return UTC `timeLogged`.
+    # A Vancouver 20:00 filler entry appears as 03:00Z on the following day,
+    # so convert back to the user's local date before duplicate checks.
+    time_logged = str(entry.get("timeLogged") or entry.get("time-logged") or "")
+    if time_logged:
+        try:
+            parsed = datetime.fromisoformat(time_logged.replace("Z", "+00:00"))
+            return parsed.astimezone(FILLER_TIMEZONE).date().isoformat()
+        except Exception:
+            return time_logged[:10]
+    return ""
+
+
+def _entry_task_id(entry: dict[str, Any]) -> str:
+    task = entry.get("task") or entry.get("todo-item") or entry.get("todoItem") or {}
+    return str(
+        entry.get("taskId")
+        or entry.get("task-id")
+        or entry.get("todoItemId")
+        or entry.get("todo-item-id")
+        or task.get("id")
+        or ""
+    )
+
+
+def _entry_user_id(entry: dict[str, Any]) -> str:
+    user = entry.get("user") or entry.get("person") or {}
+    return str(
+        entry.get("userId")
+        or entry.get("user-id")
+        or entry.get("personId")
+        or entry.get("person-id")
+        or user.get("id")
+        or ""
+    )
+
+
+def _current_timelogs(client: TeamworkClient, start: str, end: str, user_id: str) -> list[dict[str, Any]] | None:
+    """Return live Teamwork timelogs for the requested user/date range."""
+    try:
+        payload = client.get_time_entries(start, end, user_id)
+    except Exception:
+        return None
+    entries = payload.get("timelogs") or payload.get("timeEntries") or []
+    return [
+        entry for entry in entries
+        if isinstance(entry, dict)
+        and (not user_id or not _entry_user_id(entry) or _entry_user_id(entry) == str(user_id))
+    ]
+
+
+def _current_timesheet_rows(client: TeamworkClient, start: str, end: str, user_id: str) -> list[dict[str, Any]] | None:
+    """Return Teamwork timesheet summary rows for the requested user/date range.
+
+    The timelog endpoint can miss or hide detail rows for some already-logged
+    calendar events, while the timesheets endpoint still returns per-task daily
+    totals. Use this as a read-only reconciliation fallback.
+    """
+    try:
+        payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
+    except Exception:
+        return None
+    rows = payload.get("timesheets") or []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _timesheet_row_task_id(row: dict[str, Any]) -> int | None:
+    entity = row.get("entity") or {}
+    if not isinstance(entity, dict) or entity.get("type") != "tasks":
+        return None
+    try:
+        return int(entity.get("id"))
+    except Exception:
+        return None
+
+
+def _timesheet_row_minutes_for_date(row: dict[str, Any], day: str) -> int:
+    dates = row.get("dates") or {}
+    day_data = dates.get(day) if isinstance(dates, dict) else None
+    if not isinstance(day_data, dict):
+        return 0
+    return int(day_data.get("totalMinutes") or 0)
+
+
+def _event_start_value(event: dict[str, Any]) -> str:
+    return _event_datetime_value(event, "start")
+
+
+def _event_display_date(event: dict[str, Any]) -> str:
+    # Compare events in the user's local Teamwork timezone. Calendar payloads can
+    # include UTC timestamps, while Teamwork timelogs may expose either a raw UTC
+    # `timeLogged` or a local `date`; using the raw event date makes logged items
+    # look unmatched around timezone boundaries.
+    local = _event_local_date(event)
+    if local:
+        return local
+    raw = _event_start_value(event)
+    return raw[:10] if raw else ""
+
+
+def _event_start_time(event: dict[str, Any]) -> str:
+    raw = _event_start_value(event)
+    return raw[11:19] if len(raw) >= 19 else ""
+
+
+def _event_candidate_times(event: dict[str, Any]) -> set[str]:
+    """Return plausible event start times for Teamwork calendar matching.
+
+    Some Teamwork calendar events arrive with a trailing `Z` even though the
+    visible/logged time corresponds to the raw clock time, not the UTC-converted
+    Vancouver clock time. Keep both candidates so mapped timelogs are not marked
+    stale just because the calendar endpoint's timezone semantics are ambiguous.
+    """
+    candidates: set[str] = set()
+    raw = _event_start_value(event)
+    if len(raw) >= 19:
+        candidates.add(raw[11:19])
+    parsed = _parse_event_datetime(raw)
+    if parsed:
+        candidates.add(parsed.astimezone(FILLER_TIMEZONE).strftime("%H:%M:%S"))
+    return {candidate for candidate in candidates if candidate}
+
+
+def _event_duration_minutes(event: dict[str, Any]) -> int:
+    if event.get("allDay"):
+        return 480
+    raw_minutes = event.get("duration_minutes") or event.get("minutes")
+    if raw_minutes is not None:
+        try:
+            return max(0, int(raw_minutes))
+        except Exception:
+            pass
+    start_dt = _parse_event_datetime(_event_datetime_value(event, "start"))
+    end_dt = _parse_event_datetime(_event_datetime_value(event, "end"))
+    if not start_dt or not end_dt:
+        return 0
+    return max(0, int((end_dt - start_dt).total_seconds() / 60))
+
+
+def _entry_local_time(entry: dict[str, Any]) -> str:
+    raw = str(entry.get("timeLogged") or entry.get("time-logged") or "")
+    if not raw:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.astimezone(FILLER_TIMEZONE).strftime("%H:%M:%S")
+    except Exception:
+        return ""
+
+
+def _entry_raw_date(entry: dict[str, Any]) -> str:
+    raw = str(entry.get("timeLogged") or entry.get("time-logged") or "")
+    return raw[:10] if raw else ""
+
+
+def _entry_raw_time(entry: dict[str, Any]) -> str:
+    raw = str(entry.get("timeLogged") or entry.get("time-logged") or "")
+    return raw[11:19] if len(raw) >= 19 else ""
+
+
+def _time_to_minutes(value: str) -> int | None:
+    if not value:
+        return None
+    try:
+        parts = value.split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+    except Exception:
+        return None
+
+
+def _times_within_minutes(a: str, b: str, tolerance: int) -> bool:
+    a_minutes = _time_to_minutes(a)
+    b_minutes = _time_to_minutes(b)
+    if a_minutes is None or b_minutes is None:
+        return True
+    return abs(a_minutes - b_minutes) <= tolerance
+
+
+def _timelog_matches_event(entry: dict[str, Any], event: dict[str, Any], task_id: int | str) -> bool:
+    if _entry_task_id(entry) != str(task_id):
+        return False
+    return _timelog_matches_event_timebox(entry, event)
+
+
+def _plain_text(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = text.replace(":+1:", " ").replace("👍", " ").replace("✅", " ")
+    text = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _text_words(value: str) -> set[str]:
+    stop = {"event", "the", "and", "for", "with", "from", "this", "that", "work", "meeting", "call", "task", "created", "reclaim"}
+    return {word for word in _plain_text(value).split() if len(word) >= 3 and word not in stop}
+
+
+def _timelog_text_matches_event(entry: dict[str, Any], event: dict[str, Any]) -> bool:
+    title = str(event.get("title") or event.get("summary") or "")
+    description = _entry_description(entry)
+    title_text = _plain_text(title)
+    description_text = _plain_text(description)
+    if title_text and title_text in description_text:
+        return True
+    title_words = _text_words(title)
+    if not title_words:
+        return False
+    description_words = _text_words(description)
+    overlap = title_words & description_words
+    return len(overlap) >= 2 and (len(overlap) / len(title_words)) >= 0.45
+
+
+def _timelog_matches_event_timebox(entry: dict[str, Any], event: dict[str, Any]) -> bool:
+    event_dates = {_event_display_date(event)}
+    raw_event_start = _event_start_value(event)
+    if raw_event_start:
+        event_dates.add(raw_event_start[:10])
+    entry_dates = {_entry_date(entry), _entry_raw_date(entry)}
+    if not (event_dates - {""}) & (entry_dates - {""}):
+        return False
+
+    entry_minutes = int(entry.get("minutes") or 0)
+    event_minutes = _event_duration_minutes(event)
+    if entry_minutes and event_minutes and abs(entry_minutes - event_minutes) > 15:
+        return False
+
+    event_times = _event_candidate_times(event)
+    entry_times = [time for time in {_entry_raw_time(entry), _entry_local_time(entry)} if time]
+    if event_times and entry_times and not any(
+        _times_within_minutes(event_time, entry_time, 30)
+        for event_time in event_times
+        for entry_time in entry_times
+    ):
+        return False
+    return True
+
+
+def _timelog_matches_event_shape(entry: dict[str, Any], event: dict[str, Any]) -> bool:
+    return _timelog_matches_event_timebox(entry, event) and _timelog_text_matches_event(entry, event)
+
+
+def _is_meeting_event(event: dict[str, Any]) -> bool:
+    text = _plain_text(" ".join(str(event.get(key) or "") for key in ["title", "summary", "description"]))
+    return any(term in text for term in ["booking page", "join meeting", "meeting notes", "marc ramos and"])
+
+
+def _timesheet_summary_matches_event(event: dict[str, Any], rows: list[dict[str, Any]] | None) -> list[int]:
+    if not rows:
+        return []
+    event_day = _event_display_date(event)
+    event_minutes = _event_duration_minutes(event)
+    stale_ids = {int(task_id) for task_id in (event.get("staleMappedTaskIds") or []) if str(task_id).isdigit()}
+    matched_ids: list[int] = []
+    for row in rows:
+        task_id = _timesheet_row_task_id(row)
+        if not task_id:
+            continue
+        logged_minutes = _timesheet_row_minutes_for_date(row, event_day)
+        if not logged_minutes or event_minutes and abs(logged_minutes - event_minutes) > 15:
+            continue
+        if task_id in stale_ids or (_is_meeting_event(event) and task_id in KNOWN_MEETING_TASK_IDS):
+            if task_id not in matched_ids:
+                matched_ids.append(task_id)
+    return matched_ids
+
+
+def _drop_stale_mapped_task_ids(events: list[dict[str, Any]], live_timelogs: list[dict[str, Any]] | None, timesheet_rows: list[dict[str, Any]] | None = None) -> None:
+    """Reconcile calendar mappedTaskIds with live timelogs.
+
+    Calendar mappedTaskIds can be stale after deletion, while recurring/event
+    edge cases can have a real timelog without mappedTaskIds. Use exact
+    event-shaped live timelogs (date, duration, start time, title/description)
+    first, then Teamwork timesheet summary rows as a fallback for logged events
+    whose timelog details are missing from the timelog endpoint.
+    """
+    if live_timelogs is None and timesheet_rows is None:
+        return
+    live_timelogs = live_timelogs or []
+    for event in events:
+        mapped = event.get("mappedTaskIds")
+        original_mapped = mapped if isinstance(mapped, list) else []
+        current = [task_id for task_id in original_mapped if any(_timelog_matches_event(entry, event, task_id) for entry in live_timelogs)]
+        if current:
+            event["mappedTaskIds"] = current
+            continue
+
+        shaped_matches = [entry for entry in live_timelogs if _timelog_matches_event_shape(entry, event)]
+        if shaped_matches:
+            live_task_ids = []
+            for entry in shaped_matches:
+                task_id = _entry_task_id(entry)
+                if task_id and int(task_id) not in live_task_ids:
+                    live_task_ids.append(int(task_id))
+            if original_mapped:
+                event["staleMappedTaskIds"] = original_mapped
+            event["mappedTaskIds"] = live_task_ids
+            event["liveLoggedTaskIds"] = live_task_ids
+            continue
+
+        if original_mapped:
+            event["staleMappedTaskIds"] = original_mapped
+        summary_task_ids = _timesheet_summary_matches_event(event, timesheet_rows)
+        if summary_task_ids:
+            if original_mapped and set(int(task_id) for task_id in original_mapped if str(task_id).isdigit()) != set(summary_task_ids):
+                event["staleMappedTaskIds"] = original_mapped
+            else:
+                event.pop("staleMappedTaskIds", None)
+            event["mappedTaskIds"] = summary_task_ids
+            event["liveLoggedTaskIds"] = summary_task_ids
+        elif original_mapped:
+            event["mappedTaskIds"] = []
+
+
+def _entry_description(entry: dict[str, Any]) -> str:
+    return str(entry.get("description") or entry.get("body") or "")
+
+
+def _entry_matches(entry: dict[str, Any], *, date: str, task_id: int | str, description: str | None = None) -> bool:
+    if _entry_date(entry) != date:
+        return False
+    if _entry_task_id(entry) != str(task_id):
+        return False
+    if description is not None and _entry_description(entry).strip() != description.strip():
+        return False
+    return True
+
+
+def _existing_timelogs(client: TeamworkClient, start: str, end: str, user_id: str) -> list[dict[str, Any]]:
+    payload = client.get_time_entries(start_date=start, end_date=end, user_id=user_id)
+    return payload.get("timelogs", []) or payload.get("timeEntries", []) or payload.get("time-entries", []) or []
+
+
+def _filler_lock_for(user_id: str, start: str, end: str) -> Lock:
+    key = f"{user_id}:{start}:{end}"
+    with FILLER_LOCKS_GUARD:
+        if key not in FILLER_LOCKS:
+            FILLER_LOCKS[key] = Lock()
+        return FILLER_LOCKS[key]
+
+
+def _calendar_timelog_payload(entry: dict[str, Any]) -> dict[str, Any]:
+    start_at = str(entry.get("start") or entry.get("start_at") or "")
+    date = str(entry.get("date") or start_at[:10])
+    time = str(entry.get("time") or (start_at[11:19] if len(start_at) >= 19 else "09:00:00"))
+    if len(time) == 5:
+        time = f"{time}:00"
+    return {
+        "date": date,
+        "time": time,
+        "hasStartTime": True,
+        "minutes": _round_to_quarter_hour(entry.get("minutes") or entry.get("duration_minutes") or 0),
+        "description": str(entry.get("description") or f"Event: {entry.get('title', '')}"),
+        "projectId": int(entry["projectId"]),
+        "taskId": int(entry["taskId"]),
+        # Matched calendar/client work should default to billable unless the
+        # frontend explicitly sends isBillable=false. Time filler entries use a
+        # separate path and remain non-billable.
+        "isBillable": True if "isBillable" not in entry else bool(entry.get("isBillable")),
+    }
+
+
+def _plain_task_time_entry_payload(entry: dict[str, Any], user_id: str) -> dict[str, Any]:
+    timelog = _calendar_timelog_payload(entry)
+    hours, minutes = divmod(int(timelog["minutes"]), 60)
+    title = str(entry.get("title") or "Calendar event")
+    description = str(timelog.get("description") or "").strip()
+    # Keep the attendee block first for Google events too; the title was
+    # historically prepended here, ahead of the frontend's description.
+    if description.startswith("Meeting with:\n") and "\n\n" in description:
+        attendees, remainder = description.split("\n\n", 1)
+        description_parts = [attendees, title, remainder]
+    else:
+        description_parts = [title]
+        if description and description != title:
+            description_parts.append(description)
+    desk_ticket_id = entry.get("deskTicketId")
+    if desk_ticket_id and f"Desk #{desk_ticket_id} —" not in description:
+        description_parts.append(f"Desk ticket #{desk_ticket_id}: {entry.get('deskTicketSubject') or ''}".strip())
+    return {
+        "description": "\n\n".join(part for part in description_parts if part).strip(),
+        "person-id": str(user_id),
+        "date": str(timelog["date"]).replace("-", ""),
+        "time": str(timelog["time"])[:5],
+        "hours": str(hours),
+        "minutes": str(minutes),
+        "isbillable": "1" if timelog.get("isBillable") else "0",
+    }
+
+
+def _date_strings(start: str, end: str) -> list[str]:
+    try:
+        current = _parse_date(start).date()
+        end_date = _parse_date(end).date()
+    except Exception:
+        return []
+    dates: list[str] = []
+    while current <= end_date:
+        dates.append(current.isoformat())
+        current += timedelta(days=1)
+    return dates
+
+
+def _event_minutes_for_date(event: dict[str, Any], target_date: str) -> int:
+    if event.get("allDay"):
+        return 480
+    start_raw = str(event.get("startDate") or event.get("start") or "")
+    end_raw = str(event.get("endDate") or event.get("end") or "")
+    if start_raw[:10] != target_date:
+        return 0
+    try:
+        start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+        return max(0, int((end_dt - start_dt).total_seconds() / 60))
+    except Exception:
+        return 0
+
+
+def _unavailable_daily_totals(client: TeamworkClient, start: str, end: str, user_id: str) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    dates = _date_strings(start, end)
+    totals = {day: 0 for day in dates}
+    if not dates or not user_id:
+        return totals, []
+    workload = client.get_workload(start, end)
+    users = ((workload.get("workload") or {}).get("users") or []) if isinstance(workload, dict) else []
+    user_row = next((row for row in users if str(row.get("userId") or (row.get("user") or {}).get("id")) == str(user_id)), None)
+    if not user_row:
+        return totals, []
+
+    events_by_id = {str(event.get("id")): event for event in client.get_calendar_events_generic(start, end)}
+    included_events: list[dict[str, Any]] = []
+    seen_events: set[tuple[str, str]] = set()
+    for day, info in (user_row.get("dates") or {}).items():
+        if day not in totals or not isinstance(info, dict):
+            continue
+        event_refs = info.get("events") or []
+        for ref in event_refs:
+            event_id = str((ref or {}).get("id") or "")
+            if not event_id or (day, event_id) in seen_events:
+                continue
+            seen_events.add((day, event_id))
+            event = events_by_id.get(event_id)
+            minutes = _event_minutes_for_date(event or {}, day) if event else 0
+            if minutes <= 0:
+                minutes = int(info.get("capacityMinutes") or 0)
+            if minutes > 0:
+                totals[day] += min(minutes, 480)
+                included_events.append({
+                    "id": event_id,
+                    "date": day,
+                    "minutes": min(minutes, 480),
+                    "title": (event or {}).get("title") or "Unavailable",
+                    "typeId": (event or {}).get("typeId"),
+                    "startDate": (event or {}).get("startDate"),
+                    "endDate": (event or {}).get("endDate"),
+                })
+    return totals, included_events
+
+
+def _personal_commitment_daily_totals(client: TeamworkClient, start: str, end: str) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    dates = _date_strings(start, end)
+    totals = {day: 0 for day in dates}
+    if not dates:
+        return totals, []
+    events: list[dict[str, Any]] = []
+    try:
+        source_events = [_normalize_google_calendar_event(event) for event in list_google_calendar_events(start, end)] if google_calendar_configured() else client.get_calendar_events(1306, start, end)
+    except Exception:
+        source_events = client.get_calendar_events(1306, start, end)
+    for event in source_events:
+        if not _is_personal_commitment_event(event):
+            continue
+        day = _event_local_date(event)
+        if day not in totals:
+            continue
+        minutes = _event_duration_minutes(event)
+        if minutes <= 0:
+            continue
+        totals[day] += minutes
+        events.append({
+            "id": str(event.get("id") or ""),
+            "date": day,
+            "minutes": minutes,
+            "title": event.get("title") or event.get("summary") or "Personal Commitment",
+            "start": _event_datetime_value(event, "start"),
+            "end": _event_datetime_value(event, "end"),
+            "loggedAsUnavailable": False,
+        })
+    return totals, events
+
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
@@ -18,6 +726,16 @@ ASSETS_DIR = FRONTEND_DIST / "assets"
 INDEX_FILE = FRONTEND_DIST / "index.html"
 
 app = FastAPI(title=settings.app_name)
+
+
+@app.middleware("http")
+async def no_store_api_responses(request: Request, call_next) -> Response:
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 # Register auth routes (Google OAuth)
 app.include_router(auth_router)
@@ -52,23 +770,52 @@ def teamwork_timesheets(
     teamwork_settings = get_teamwork_settings()
     if not teamwork_settings.has_credentials:
         raise HTTPException(status_code=503, detail="Teamwork is not configured")
+    client = TeamworkClient(settings=teamwork_settings)
+    effective_user_id = userId or teamwork_settings.user_id
     try:
-        payload = TeamworkClient(settings=teamwork_settings).get_timesheets(
+        payload = client.get_timesheets(
             start_date=startDate,
             end_date=endDate,
-            user_id=userId,
+            user_id=effective_user_id,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     timesheets = payload.get("timesheets", [])
     meta = payload.get("meta", {}) or {}
     totals = ((meta.get("dailyTotals") or {}) if isinstance(meta, dict) else {})
+    unavailable_totals: dict[str, int] = {}
+    unavailable_events: list[dict[str, Any]] = []
+    personal_commitment_totals: dict[str, int] = {}
+    personal_commitment_events: list[dict[str, Any]] = []
+    if startDate and endDate and effective_user_id:
+        try:
+            unavailable_totals, unavailable_events = _unavailable_daily_totals(client, startDate, endDate, str(effective_user_id))
+        except Exception:
+            unavailable_totals, unavailable_events = {}, []
+        try:
+            personal_commitment_totals, personal_commitment_events = _personal_commitment_daily_totals(client, startDate, endDate)
+        except Exception:
+            personal_commitment_totals, personal_commitment_events = {}, []
+    credited_totals = {
+        day: int(totals.get(day, 0) or 0) + int(unavailable_totals.get(day, 0) or 0)
+        for day in sorted(set(totals) | set(unavailable_totals))
+    }
+    personal_commitment_unlogged_totals = {
+        day: max(int(personal_commitment_totals.get(day, 0) or 0) - int(unavailable_totals.get(day, 0) or 0), 0)
+        for day in sorted(set(personal_commitment_totals) | set(unavailable_totals))
+    }
     return {
         "site": teamwork_settings.site,
-        "user_id": userId or teamwork_settings.user_id,
+        "user_id": effective_user_id,
         "query": {"startDate": startDate, "endDate": endDate},
         "count": len(timesheets),
         "dailyTotals": totals,
+        "unavailableDailyTotals": unavailable_totals,
+        "creditedDailyTotals": credited_totals,
+        "personalCommitmentDailyTotals": personal_commitment_totals,
+        "personalCommitmentUnloggedDailyTotals": personal_commitment_unlogged_totals,
+        "unavailableEvents": unavailable_events,
+        "personalCommitmentEvents": personal_commitment_events,
         "timesheets": timesheets,
     }
 
@@ -89,58 +836,273 @@ def list_calendars() -> dict[str, object]:
 def get_events(
     start: str = Query(..., description="YYYY-MM-DD"),
     end: str = Query(..., description="YYYY-MM-DD"),
+    source: str = Query("teamwork", description="Event source: teamwork, google, or auto"),
 ) -> dict[str, object]:
     teamwork_settings = get_teamwork_settings()
     if not teamwork_settings.has_credentials:
         raise HTTPException(status_code=503, detail="Teamwork is not configured")
     client = TeamworkClient(settings=teamwork_settings)
-    try:
-        calendars = client.list_calendars()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch calendars: {exc}")
 
     all_events: list[dict[str, Any]] = []
-    for cal in calendars:
-        cal_id = cal.get("id")
-        if not cal_id:
-            continue
+    requested_source = source.strip().lower()
+    if requested_source not in {"teamwork", "google", "auto"}:
+        raise HTTPException(status_code=400, detail="source must be one of: teamwork, google, auto")
+
+    google_is_configured = google_calendar_configured()
+    event_source = "google" if requested_source == "google" or (requested_source == "auto" and google_is_configured) else "teamwork"
+    fallback_from: str | None = None
+    google_error: str | None = None
+    if event_source == "google":
+        if not google_is_configured:
+            raise HTTPException(status_code=503, detail="Google Calendar is not connected")
         try:
-            events = client.get_calendar_events(cal_id, start, end)
-            for ev in events:
-                ev["_calendar_name"] = cal.get("name", "")
-                # Normalize field names
-                ev["title"] = ev.get("summary", ev.get("title", ""))
-                ev_start = ev.get("start", {})
-                ev_end = ev.get("end", {})
-                if isinstance(ev_start, dict):
-                    ev["start_at"] = ev_start.get("dateTime", "")
-                else:
-                    ev["start_at"] = str(ev_start)
-                if isinstance(ev_end, dict):
-                    ev["end_at"] = ev_end.get("dateTime", "")
-                else:
-                    ev["end_at"] = str(ev_end)
-                # Compute duration in minutes
-                if ev.get("duration_minutes") is None and ev["start_at"] and ev["end_at"]:
-                    try:
-                        from datetime import datetime
-                        s = datetime.fromisoformat(ev["start_at"].replace("Z", "+00:00"))
-                        e = datetime.fromisoformat(ev["end_at"].replace("Z", "+00:00"))
-                        ev["duration_minutes"] = int((e - s).total_seconds() / 60)
-                    except Exception:
-                        ev["duration_minutes"] = 0
-            all_events.extend(events)
-        except Exception:
-            pass
+            all_events = [_normalize_google_calendar_event(event) for event in list_google_calendar_events(start, end)]
+        except Exception as exc:
+            if requested_source != "auto":
+                raise HTTPException(status_code=502, detail=f"Failed to fetch Google Calendar events: {exc}")
+            # In auto mode, a saved Google token can become unusable if the OAuth
+            # project loses Calendar API access, the account revokes consent, or
+            # scopes change. Do not break the matching page; fall back to Teamwork's
+            # calendar feed and expose the fallback in the query metadata.
+            google_error = str(exc)
+            fallback_from = "google"
+            event_source = "teamwork"
+            all_events = []
+
+    if event_source == "teamwork":
+        try:
+            calendars = client.list_calendars()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch calendars: {exc}")
+
+        # Legacy Teamwork fallback. Teamwork's calendar APIs have become unreliable
+        # for the personal calendar feed, so production should connect Google
+        # Calendar by re-running Google login with calendar consent.
+        target_calendars = [cal for cal in calendars if str(cal.get("id")) == "1306"] or calendars
+        for cal in target_calendars:
+            cal_id = cal.get("id")
+            if not cal_id:
+                continue
+            try:
+                events = client.get_calendar_events(cal_id, start, end)
+                for ev in events:
+                    ev["source"] = "teamwork"
+                    ev["_calendar_name"] = cal.get("name", "")
+                    ev["calendarId"] = cal_id
+                    # Normalize field names
+                    ev["title"] = ev.get("summary", ev.get("title", ""))
+                    ev["description"] = _clean_event_description(ev.get("description"))
+                    ev_start = ev.get("start", {})
+                    ev_end = ev.get("end", {})
+                    if isinstance(ev_start, dict):
+                        ev["start_at"] = ev_start.get("dateTime", "")
+                    else:
+                        ev["start_at"] = str(ev_start)
+                    if isinstance(ev_end, dict):
+                        ev["end_at"] = ev_end.get("dateTime", "")
+                    else:
+                        ev["end_at"] = str(ev_end)
+                    # Frontend expects strings; do not leak Teamwork's nested start/end dicts.
+                    ev["start"] = ev.get("start_at", "")
+                    ev["end"] = ev.get("end_at", "")
+                    # Compute duration in minutes
+                    if ev.get("duration_minutes") is None and ev["start_at"] and ev["end_at"]:
+                        try:
+                            s = datetime.fromisoformat(ev["start_at"].replace("Z", "+00:00"))
+                            e = datetime.fromisoformat(ev["end_at"].replace("Z", "+00:00"))
+                            ev["duration_minutes"] = int((e - s).total_seconds() / 60)
+                        except Exception:
+                            ev["duration_minutes"] = 0
+                all_events.extend(events)
+            except Exception:
+                pass
+
+    # Calendar endpoints can ignore date params; filter on normalized start_at here.
+    try:
+        filter_start = datetime.strptime(start, "%Y-%m-%d").date()
+        filter_end = datetime.strptime(end, "%Y-%m-%d").date()
+        filtered_events: list[dict[str, Any]] = []
+        for ev in all_events:
+            ev_start = str(ev.get("start_at") or ev.get("start") or "")
+            if not ev_start:
+                filtered_events.append(ev)
+                continue
+            try:
+                ev_date = datetime.fromisoformat(ev_start.replace("Z", "+00:00")).date()
+                if filter_start <= ev_date <= filter_end:
+                    filtered_events.append(ev)
+            except Exception:
+                filtered_events.append(ev)
+        all_events = filtered_events
+    except Exception:
+        pass
+
+    all_events = [ev for ev in all_events if not _is_excluded_matching_event(ev)]
+
+    effective_user_id = teamwork_settings.user_id or ""
+    live_timelogs = _current_timelogs(client, start, end, effective_user_id)
+    timesheet_rows = _current_timesheet_rows(client, start, end, effective_user_id)
+    _drop_stale_mapped_task_ids(all_events, live_timelogs, timesheet_rows)
 
     # Sort by start_at
-    all_events.sort(key=lambda e: e.get("start_at", ""))
+    all_events.sort(key=lambda e: str(e.get("start_at", "")))
+
+    query: dict[str, Any] = {"start": start, "end": end, "source": event_source, "requestedSource": requested_source}
+    if fallback_from:
+        query["fallbackFrom"] = fallback_from
+    if google_error:
+        query["googleCalendarError"] = google_error
 
     return {
-        "query": {"start": start, "end": end},
+        "query": query,
         "count": len(all_events),
         "events": all_events,
     }
+
+
+def _company_name_key(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _desk_company_id_for_project(project: dict[str, Any]) -> int | None:
+    company = project.get("company") or {}
+    company_name = ""
+    if isinstance(company, dict):
+        company_name = str(company.get("name") or "")
+    for name, desk_company_id in DESK_COMPANY_ID_BY_PROJECT_COMPANY_NAME.items():
+        if name in _company_name_key(company_name) or name in _company_name_key(project.get("name")):
+            return desk_company_id
+    return None
+
+
+def _project_ids_from_desk_ticket(ticket: dict[str, Any]) -> list[int]:
+    """Return Teamwork Projects project IDs explicitly linked from Desk data.
+
+    Desk thread `taskId` values are Desk/Projects task identifiers, not project
+    IDs. Treating them as project IDs makes the frontend select an invisible
+    project and leaves Match disabled.
+    """
+    project_ids: list[int] = []
+    candidates: list[Any] = [
+        ticket.get("projectId"),
+        ticket.get("project-id"),
+        (ticket.get("project") or {}).get("id") if isinstance(ticket.get("project"), dict) else None,
+    ]
+    for thread in ticket.get("threads") or []:
+        if not isinstance(thread, dict):
+            continue
+        candidates.extend([
+            thread.get("projectId"),
+            thread.get("project-id"),
+            (thread.get("project") or {}).get("id") if isinstance(thread.get("project"), dict) else None,
+        ])
+    for raw_id in candidates:
+        if raw_id is None:
+            continue
+        try:
+            project_id = int(raw_id)
+        except Exception:
+            continue
+        if project_id and project_id not in project_ids:
+            project_ids.append(project_id)
+    return project_ids
+
+
+def _desk_ticket_company(ticket: dict[str, Any]) -> dict[str, Any]:
+    company = ticket.get("company")
+    if isinstance(company, dict) and company.get("name"):
+        return company
+    customer = ticket.get("customer") or {}
+    nested = ((customer.get("company") or {}).get("company") or {}) if isinstance(customer, dict) else {}
+    return nested if isinstance(nested, dict) else {}
+
+
+def _normalize_desk_ticket(ticket: dict[str, Any], project_ids: list[int] | None = None) -> dict[str, Any]:
+    company = _desk_ticket_company(ticket)
+    customer = ticket.get("customer") or {}
+    assigned = ticket.get("assignedTo") or {}
+    inferred_project_ids = project_ids if project_ids is not None else _project_ids_from_desk_ticket(ticket)
+    return {
+        "id": ticket.get("id"),
+        "subject": ticket.get("subject") or "",
+        "preview": ticket.get("preview") or "",
+        "status": ticket.get("status") or "",
+        "state": ticket.get("state") or "",
+        "priority": ticket.get("priority") or "",
+        "type": ticket.get("type") or "",
+        "source": ticket.get("source") or "",
+        "createdAt": ticket.get("createdAt") or "",
+        "updatedAt": ticket.get("updatedAt") or "",
+        "companyName": company.get("name") or "",
+        "deskCompanyId": company.get("id"),
+        "customerName": " ".join(part for part in [customer.get("firstName"), customer.get("lastName")] if part),
+        "customerEmail": customer.get("email") or "",
+        "assignedToName": " ".join(part for part in [assigned.get("firstName"), assigned.get("lastName")] if part),
+        "assignedToEmail": assigned.get("email") or "",
+        "projectIds": inferred_project_ids,
+    }
+
+
+def _desk_ticket_search_text(ticket: dict[str, Any]) -> str:
+    normalized = _normalize_desk_ticket(ticket)
+    return _company_name_key(" ".join(str(normalized.get(key) or "") for key in [
+        "id", "subject", "preview", "status", "priority", "type", "companyName", "customerName", "customerEmail", "assignedToEmail",
+    ]))
+
+
+@app.get("/api/teamwork/desk-tickets")
+def list_desk_tickets(
+    projectId: int | None = Query(None),
+    ticketId: int | None = Query(None),
+    query: str = Query(""),
+    limit: int = Query(15, ge=1, le=50),
+) -> dict[str, object]:
+    teamwork_settings = get_teamwork_settings()
+    if not teamwork_settings.has_credentials:
+        raise HTTPException(status_code=503, detail="Teamwork is not configured")
+    client = TeamworkClient(settings=teamwork_settings)
+
+    if ticketId:
+        try:
+            ticket = client.get_desk_ticket(ticketId)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch Desk ticket {ticketId}: {exc}")
+        if not ticket:
+            return {"tickets": [], "count": 0}
+        return {"tickets": [_normalize_desk_ticket(ticket)], "count": 1}
+
+    if not projectId:
+        raise HTTPException(status_code=400, detail="projectId or ticketId is required")
+
+    try:
+        project = client.get_project(projectId)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Teamwork project {projectId}: {exc}")
+    desk_company_id = _desk_company_id_for_project(project)
+    if not desk_company_id:
+        return {"tickets": [], "count": 0, "projectId": projectId, "message": "No Desk company mapping for this project yet."}
+
+    try:
+        first_page = client.list_desk_tickets(desk_company_id, page=1, page_size=100)
+        max_pages = int(first_page.get("maxPages") or 1)
+        pages = sorted(set([max_pages, max(1, max_pages - 1), max(1, max_pages - 2)]))
+        raw_tickets: list[dict[str, Any]] = []
+        for page in pages:
+            payload = first_page if page == 1 else client.list_desk_tickets(desk_company_id, page=page, page_size=100)
+            raw_tickets.extend([ticket for ticket in payload.get("tickets") or [] if isinstance(ticket, dict)])
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Teamwork Desk tickets: {exc}")
+
+    terms = [term for term in _company_name_key(query).split() if len(term) >= 2]
+    if terms:
+        raw_tickets = [ticket for ticket in raw_tickets if all(term in _desk_ticket_search_text(ticket) for term in terms)]
+
+    def sort_key(ticket: dict[str, Any]) -> str:
+        return str(ticket.get("updatedAt") or ticket.get("createdAt") or "")
+
+    raw_tickets = sorted(raw_tickets, key=sort_key, reverse=True)[:limit]
+    normalized = [_normalize_desk_ticket(ticket, project_ids=sorted(set([projectId, *_project_ids_from_desk_ticket(ticket)]))) for ticket in raw_tickets]
+    return {"tickets": normalized, "count": len(normalized), "projectId": projectId, "deskCompanyId": desk_company_id}
 
 
 @app.get("/api/teamwork/projects")
@@ -165,6 +1127,273 @@ def list_tasks(project_id: int) -> dict[str, object]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     return {"tasks": tasks}
+
+
+@app.post("/api/teamwork/submit-matched")
+def submit_matched(payload: dict[str, Any]) -> dict[str, object]:
+    teamwork_settings = get_teamwork_settings()
+    if not teamwork_settings.has_credentials:
+        raise HTTPException(status_code=503, detail="Teamwork is not configured")
+    client = TeamworkClient(settings=teamwork_settings)
+    entries = payload.get("entries") or []
+    if not isinstance(entries, list):
+        raise HTTPException(status_code=400, detail="entries must be a list")
+
+    created: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        event_id = str(entry.get("eventId") or "")
+        if entry.get("mappedTaskIds"):
+            skipped.append({"eventId": event_id, "reason": "already linked in Teamwork"})
+            continue
+        if not event_id or not entry.get("projectId") or not entry.get("taskId"):
+            skipped.append({"eventId": event_id, "reason": "missing project/task/event id"})
+            continue
+        timelog = _calendar_timelog_payload(entry)
+        if timelog["minutes"] <= 0:
+            skipped.append({"eventId": event_id, "reason": "zero duration"})
+            continue
+        try:
+            if entry.get("source") == "google" or str(entry.get("calendarId") or "") == "google" or event_id.startswith("google:"):
+                time_entry = _plain_task_time_entry_payload(entry, teamwork_settings.user_id or "531538")
+                task_id = int(entry["taskId"])
+                result = client.create_task_time_entry(task_id, time_entry)
+                created.append({"eventId": event_id, "taskId": task_id, "minutes": timelog["minutes"], "source": "google", "result": result})
+            else:
+                result = client.log_calendar_event_time(entry.get("calendarId") or 1306, event_id, timelog)
+                created.append({"eventId": event_id, "taskId": timelog["taskId"], "minutes": timelog["minutes"], "source": "teamwork", "result": result})
+        except Exception as exc:
+            errors.append({"eventId": event_id, "error": str(exc)})
+
+    return {"status": "ok" if not errors else "partial", "created": created, "skipped": skipped, "errors": errors}
+
+
+def _filler_workdays(start: str, end: str) -> tuple[date, date, list[date]]:
+    try:
+        start_date = _parse_date(start).date()
+        end_date = _parse_date(end).date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="start/end must be YYYY-MM-DD")
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="end must be on or after start")
+    workdays: list[date] = []
+    cursor = start_date
+    while cursor <= end_date:
+        if cursor.weekday() < 5:
+            workdays.append(cursor)
+        cursor += timedelta(days=1)
+    return start_date, end_date, workdays
+
+
+def _build_timesheet_filler_plan(client: TeamworkClient, start: str, end: str, user_id: str) -> dict[str, object]:
+    start_date, end_date, workdays = _filler_workdays(start, end)
+    existing_end = (end_date + timedelta(days=1)).isoformat()
+    existing = _existing_timelogs(client, start, existing_end, user_id)
+    totals_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
+    daily_totals = ((totals_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(totals_payload, dict) else {}
+    try:
+        unavailable_totals, _unavailable_events = _unavailable_daily_totals(client, start, end, user_id)
+    except Exception:
+        unavailable_totals = {}
+    credited_totals = {
+        day.isoformat(): int(daily_totals.get(day.isoformat(), 0) or 0) + int(unavailable_totals.get(day.isoformat(), 0) or 0)
+        for day in workdays
+    }
+    weekly_current_minutes = sum(int(credited_totals.get(day.isoformat()) or 0) for day in workdays)
+    weekly_remaining_minutes = max(WORK_WEEK_TARGET_MINUTES - weekly_current_minutes, 0)
+
+    existing_filler_dates = sorted({
+        day.isoformat()
+        for day in workdays
+        if any(_entry_matches(e, date=day.isoformat(), task_id=FILLER_TASK_ID, description=FILLER_DESCRIPTION) for e in existing)
+    })
+    existing_by_date_description = {
+        (day.isoformat(), str(category["description"]))
+        for day in workdays
+        for category in FILLER_CATEGORIES
+        if any(_entry_matches(e, date=day.isoformat(), task_id=FILLER_TASK_ID, description=str(category["description"])) for e in existing)
+    }
+
+    skipped: list[dict[str, Any]] = []
+    plan: list[dict[str, Any]] = []
+    remaining_to_fill = weekly_remaining_minutes
+    for day in workdays:
+        if remaining_to_fill <= 0:
+            break
+        date_key = day.isoformat()
+        day_logged = int(credited_totals.get(date_key) or 0)
+        day_capacity = max(WORK_DAY_TARGET_MINUTES - day_logged, 0)
+        day_to_fill = min(day_capacity, remaining_to_fill)
+        if day_to_fill <= 0:
+            continue
+        for category in FILLER_CATEGORIES:
+            if day_to_fill <= 0 or remaining_to_fill <= 0:
+                break
+            description = str(category["description"])
+            if (date_key, description) in existing_by_date_description:
+                skipped.append({"date": date_key, "description": description, "reason": "filler category already exists for this date"})
+                continue
+            minutes = min(int(category["max_minutes_per_day"]), day_to_fill, remaining_to_fill)
+            minutes = (minutes // 15) * 15
+            if minutes <= 0:
+                continue
+            plan.append({
+                "date": date_key,
+                "description": description,
+                "minutes": minutes,
+                "startTime": str(category["start_time"]),
+                "taskId": FILLER_TASK_ID,
+            })
+            day_to_fill -= minutes
+            remaining_to_fill -= minutes
+
+    planned_minutes = sum(int(item["minutes"]) for item in plan)
+    projected_weekly_minutes = weekly_current_minutes + planned_minutes
+    return {
+        "status": "planned" if plan else ("exists" if weekly_remaining_minutes <= 0 else "partial"),
+        "message": f"Planned {len(plan)} filler entries for {(planned_minutes / 60):.2f}h; projected week is {(projected_weekly_minutes / 60):.2f}h / 40.0h.",
+        "plan": plan,
+        "skipped": skipped,
+        "existingDates": existing_filler_dates,
+        "dailyTotals": daily_totals,
+        "unavailableDailyTotals": unavailable_totals,
+        "creditedDailyTotals": credited_totals,
+        "weeklyCurrentMinutes": weekly_current_minutes,
+        "weeklyTargetMinutes": WORK_WEEK_TARGET_MINUTES,
+        "weeklyRemainingMinutes": weekly_remaining_minutes,
+        "plannedMinutes": planned_minutes,
+        "projectedWeeklyMinutes": projected_weekly_minutes,
+        "fillerTaskId": FILLER_TASK_ID,
+    }
+
+
+def _validate_approved_filler_plan(plan: Any) -> list[dict[str, Any]]:
+    if not isinstance(plan, list) or not plan:
+        raise HTTPException(status_code=400, detail="approved plan is required")
+    allowed_descriptions = {str(category["description"]) for category in FILLER_CATEGORIES}
+    approved: list[dict[str, Any]] = []
+    for item in plan:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="plan entries must be objects")
+        date_key = str(item.get("date") or "")
+        description = str(item.get("description") or "")
+        try:
+            datetime.strptime(date_key, "%Y-%m-%d")
+            minutes = int(item.get("minutes") or 0)
+            task_id = int(item.get("taskId") or 0)
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid plan entry")
+        if task_id != FILLER_TASK_ID or description not in allowed_descriptions or minutes <= 0 or minutes % 15 != 0:
+            raise HTTPException(status_code=400, detail="invalid plan entry")
+        approved.append({
+            "date": date_key,
+            "description": description,
+            "minutes": minutes,
+            "startTime": str(item.get("startTime") or FILLER_START_TIME),
+            "taskId": FILLER_TASK_ID,
+        })
+    return approved
+
+
+@app.post("/api/teamwork/timesheet-filler/plan")
+def plan_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
+    teamwork_settings = get_teamwork_settings()
+    if not teamwork_settings.has_credentials:
+        raise HTTPException(status_code=503, detail="Teamwork is not configured")
+    user_id = teamwork_settings.user_id or "531538"
+    start = str(payload.get("start") or "")
+    end = str(payload.get("end") or "")
+    if not start or not end:
+        raise HTTPException(status_code=400, detail="start and end are required")
+    client = TeamworkClient(settings=teamwork_settings)
+    return _build_timesheet_filler_plan(client, start, end, str(user_id))
+
+
+@app.post("/api/teamwork/timesheet-filler/create")
+def create_approved_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
+    teamwork_settings = get_teamwork_settings()
+    if not teamwork_settings.has_credentials:
+        raise HTTPException(status_code=503, detail="Teamwork is not configured")
+    user_id = teamwork_settings.user_id or "531538"
+    start = str(payload.get("start") or "")
+    end = str(payload.get("end") or "")
+    if not start or not end:
+        raise HTTPException(status_code=400, detail="start and end are required")
+    _start_date, _end_date, workdays = _filler_workdays(start, end)
+    approved_plan = _validate_approved_filler_plan(payload.get("plan"))
+    client = TeamworkClient(settings=teamwork_settings)
+    lock = _filler_lock_for(str(user_id), start, end)
+    if not lock.acquire(blocking=False):
+        return {"status": "running", "message": "Time Sheet Filler is already running for this loaded range.", "created": [], "skipped": [], "dailyTotals": {}}
+    try:
+        # An approved row may be sent on its own or as part of the full plan.
+        # Compare against current Teamwork data so stale/replayed rows cannot
+        # duplicate a category or push a day/week beyond its planned capacity.
+        current_plan = _build_timesheet_filler_plan(client, start, end, str(user_id))
+        available_rows = {
+            (item["date"], item["description"], item["minutes"], item["startTime"], item["taskId"])
+            for item in cast(list[dict[str, Any]], current_plan["plan"])
+        }
+        created: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for item in approved_plan:
+            date_key = str(item["date"])
+            minutes = int(item["minutes"])
+            row_key = (date_key, item["description"], minutes, item["startTime"], item["taskId"])
+            if row_key not in available_rows:
+                skipped.append({"date": date_key, "description": item["description"], "minutes": minutes, "reason": "Filler proposal is no longer current; plan again before submitting."})
+                continue
+            available_rows.remove(row_key)
+            time_entry = {
+                "description": str(item["description"]),
+                "person-id": str(user_id),
+                "date": datetime.strptime(date_key, "%Y-%m-%d").strftime("%Y%m%d"),
+                "time": str(item["startTime"]),
+                "hours": str(minutes // 60),
+                "minutes": str(minutes % 60),
+                "isbillable": FILLER_BILLABLE,
+            }
+            try:
+                result = client.create_task_time_entry(FILLER_TASK_ID, time_entry)
+                created.append({"date": date_key, "description": item["description"], "minutes": minutes, "taskId": FILLER_TASK_ID, "result": result})
+            except Exception as exc:
+                skipped.append({"date": date_key, "description": item["description"], "minutes": minutes, "reason": str(exc)})
+
+        verify_payload = client.get_timesheets(start_date=start, end_date=end, user_id=user_id)
+        verified_daily_totals = ((verify_payload.get("meta") or {}).get("dailyTotals") or {}) if isinstance(verify_payload, dict) else {}
+        try:
+            verified_unavailable_totals, _verified_unavailable_events = _unavailable_daily_totals(client, start, end, str(user_id))
+        except Exception:
+            verified_unavailable_totals = {}
+        verified_credited_totals = {
+            day.isoformat(): int(verified_daily_totals.get(day.isoformat(), 0) or 0) + int(verified_unavailable_totals.get(day.isoformat(), 0) or 0)
+            for day in workdays
+        }
+        verified_weekly_minutes = sum(int(verified_credited_totals.get(day.isoformat()) or 0) for day in workdays)
+        verified_remaining_minutes = max(WORK_WEEK_TARGET_MINUTES - verified_weekly_minutes, 0)
+        status = "ok" if created and verified_remaining_minutes == 0 else ("partial" if created else "exists")
+        return {
+            "status": status,
+            "message": f"Created {len(created)} approved Time Sheet Filler entries using task {FILLER_TASK_ID}; week is now {(verified_weekly_minutes / 60):.2f}h / 40.0h.",
+            "created": created,
+            "skipped": skipped,
+            "dailyTotals": verified_daily_totals,
+            "unavailableDailyTotals": verified_unavailable_totals,
+            "creditedDailyTotals": verified_credited_totals,
+            "weeklyTargetMinutes": WORK_WEEK_TARGET_MINUTES,
+            "weeklyRemainingMinutes": verified_remaining_minutes,
+            "fillerTaskId": FILLER_TASK_ID,
+        }
+    finally:
+        lock.release()
+
+
+@app.post("/api/teamwork/timesheet-filler")
+def run_timesheet_filler(payload: dict[str, Any]) -> dict[str, object]:
+    raise HTTPException(status_code=400, detail="Use /api/teamwork/timesheet-filler/plan, then /api/teamwork/timesheet-filler/create with the approved plan")
 
 
 @app.post("/api/proposals/generate")
