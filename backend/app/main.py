@@ -107,8 +107,8 @@ def _clean_event_description(description: str | None) -> str:
     # Keep the real task details above it, but never submit the reminder below.
     text = re.split(r"(?m)^[ \t]*~{4,}[ \t]*(?:\n|$)", text, maxsplit=1)[0]
     # Reclaim Booking Page descriptions contain conferencing links, a passcode,
-    # and cancellation instructions around the actual meeting notes. Only use
-    # the footer as a cutoff when a preceding Meeting notes/details section exists.
+    # and cancellation instructions around the actual meeting notes. When no
+    # notes were supplied, remove the booking block rather than submitting it.
     notes = re.search(r"\bMeeting\s+(notes|details)\s*:", text, flags=re.IGNORECASE)
     footer = re.search(
         r"Want\s+to\s+make\s+changes\s+to\s+this\s+event\?\s*You\s+can\s+edit\s+"
@@ -121,6 +121,10 @@ def _clean_event_description(description: str | None) -> str:
         note_body = text[notes.end():footer.start()].strip()
         if note_body:
             text = f"Meeting {notes.group(1).lower()}: {note_body}"
+    if footer and re.search(r"\bEvent\s+name\s*:\s*Booking\s+Page\b", text[:footer.start()], re.IGNORECASE):
+        booking_start = re.search(r"(?im)^[ \t]*Join meeting now[ \t]*(?:\n|$)", text[:footer.start()])
+        if booking_start:
+            text = text[:booking_start.start()]
     # Drop conferencing instructions, not the agenda before or after them.
     # The two long Teams rules delimit its block; the shorter internal rule
     # between passcode and phone details must not end the match early.

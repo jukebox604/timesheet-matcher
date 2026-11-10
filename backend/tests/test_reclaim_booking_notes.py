@@ -37,6 +37,20 @@ def test_booking_page_meeting_details_and_wrapped_footer():
     assert _clean_event_description(description) == "Meeting details: Review specifications."
 
 
+def test_booking_page_without_notes_is_entirely_noise():
+    description = (
+        "Join meeting now\n"
+        "Passcode: 509116 Event name: Booking Page\n"
+        "Want to make changes to this event? You can edit the event directly or use the links below to cancel or reschedule.\n"
+        "Cancel: https://app.reclaim.ai/meeting/example?action=cancel\n"
+        "Reschedule: https://app.reclaim.ai/meeting/example/reschedule"
+    )
+    assert _clean_event_description(description) == ""
+    assert _clean_event_description("Agenda: discuss mappings.\n\n" + description) == "Agenda: discuss mappings."
+    assert _clean_event_description(description.replace("Want to make changes", "Meeting notes:\nWant to make changes")) == ""
+    assert _clean_event_description(description.replace("Event name: Booking Page", "Meeting notes:")) == description.replace("Event name: Booking Page", "Meeting notes:")
+
+
 def test_regular_meeting_without_reclaim_footer_is_untouched():
     description = "Join meeting now\nMeeting notes: Agenda\nKeep this line of details."
     assert _clean_event_description(description) == description
