@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, planTimesheetFiller, createTimesheetFiller, fetchDeskTickets, type EventItem, type TeamworkProject, type TeamworkTask, type DeskTicket, type EventSource, type FillerPlanResponse } from './timesheet'
+import { descriptionWithAttendees } from './attendeeDetails'
 import { roundToQuarterHour } from './timeRounding.js'
 
 interface MatchEntry {
@@ -624,12 +625,6 @@ function deskTicketLabel(ticket: DeskTicket) {
   return `#${ticket.id} — ${ticket.subject}`
 }
 
-function descriptionWithDeskTicket(ev: EventItem, ticket?: DeskTicket) {
-  const base = ev.description || `Event: ${ev.title || ''}`
-  if (!ticket) return base
-  return `Desk #${ticket.id} — ${ticket.subject}\n\n${base}`
-}
-
 export default function Events() {
   const defaults = useMemo(() => currentWorkWeek(), [])
   const [start, setStart] = useState(defaults.start)
@@ -953,7 +948,7 @@ export default function Events() {
           eventId: ev.id,
           calendarId: ev.calendarId || 1306,
           title: ev.title,
-          description: descriptionWithDeskTicket(ev, deskTicket),
+          description: descriptionWithAttendees(ev, deskTicket),
           start: ev.start,
           duration_minutes: roundToQuarterHour(ev.duration_minutes),
           projectId: Number(match!.projectId),
@@ -1298,7 +1293,7 @@ export default function Events() {
                   {roundedDurationMinutes !== originalDurationMinutes ? ` (rounded from ${formatDuration(originalDurationMinutes)})` : ''}
                   {ev._calendar_name ? ` · ${ev._calendar_name}` : ''}
                 </div>
-                <p className="event-description">{cleanDescription(ev.description)}</p>
+                <p className="event-description">{cleanDescription(descriptionWithAttendees(ev, selectedDeskTicket))}</p>
                 <div className="suggestion-box">
                   <span className="suggestion-label">Suggested match</span>
                   {suggestion ? (

@@ -545,12 +545,19 @@ def _calendar_timelog_payload(entry: dict[str, Any]) -> dict[str, Any]:
 def _plain_task_time_entry_payload(entry: dict[str, Any], user_id: str) -> dict[str, Any]:
     timelog = _calendar_timelog_payload(entry)
     hours, minutes = divmod(int(timelog["minutes"]), 60)
-    description_parts = [str(entry.get("title") or "Calendar event")]
+    title = str(entry.get("title") or "Calendar event")
     description = str(timelog.get("description") or "").strip()
-    if description and description not in description_parts:
-        description_parts.append(description)
+    # Keep the attendee block first for Google events too; the title was
+    # historically prepended here, ahead of the frontend's description.
+    if description.startswith("Meeting with:\n") and "\n\n" in description:
+        attendees, remainder = description.split("\n\n", 1)
+        description_parts = [attendees, title, remainder]
+    else:
+        description_parts = [title]
+        if description and description != title:
+            description_parts.append(description)
     desk_ticket_id = entry.get("deskTicketId")
-    if desk_ticket_id:
+    if desk_ticket_id and f"Desk #{desk_ticket_id} —" not in description:
         description_parts.append(f"Desk ticket #{desk_ticket_id}: {entry.get('deskTicketSubject') or ''}".strip())
     return {
         "description": "\n\n".join(part for part in description_parts if part).strip(),
