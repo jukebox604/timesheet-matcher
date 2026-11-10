@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { fetchEvents, fetchProjects, fetchTasks, fetchTimesheetTotals, submitMatchedEntries, planTimesheetFiller, createTimesheetFiller, fetchDeskTickets, type EventItem, type TeamworkProject, type TeamworkTask, type DeskTicket, type EventSource, type FillerPlanResponse } from './timesheet'
 import { descriptionWithAttendees } from './attendeeDetails'
+import { matchProjectPrefix } from './projectPrefixMatch.js'
 import { roundToQuarterHour } from './timeRounding.js'
 
 interface MatchEntry {
@@ -434,9 +435,20 @@ function scoreRule(rule: MatchRule, ev: EventItem) {
   }
 }
 
-function suggestForEvent(ev: EventItem): SuggestedMatch | null {
+function suggestForEvent(ev: EventItem, availableProjects: TeamworkProject[] = []): SuggestedMatch | null {
   const mapped = suggestedFromKnownMappedTask(ev)
   if (mapped) return mapped
+
+  const prefix = matchProjectPrefix(ev.title, availableProjects)
+  if (prefix?.ambiguous) return null // Never guess which project a shared code means.
+  if (prefix) return {
+    projectId: prefix.projectId,
+    projectName: prefix.projectName,
+    taskId: 0,
+    taskName: 'Select task after loading project tasks',
+    reason: `Client prefix “${prefix.label}” matches the active Teamwork project; review the task`,
+    confidence: 95,
+  }
 
   const ranked = MATCH_RULES
     .map(rule => ({ rule, ...scoreRule(rule, ev) }))
@@ -710,19 +722,14 @@ export default function Events() {
     }
   }, [mergeDeskTickets])
 
-  useEffect(() => {
-    fetchProjects()
-      .then(setProjects)
-      .catch(() => {})
-  }, [])
-
   const handleLoad = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
-      const [data, dailyTotals] = await Promise.all([
+      const [data, dailyTotals, availableProjects] = await Promise.all([
         fetchEvents(start, end, eventSource),
         fetchTimesheetTotals(start, end),
+        fetchProjects().catch(() => projects),
       ])
       const loadedEvents = data.events || []
       const loadedLoggedMinutes = Object.values(dailyTotals.dailyTotals).reduce((total, minutes) => total + Number(minutes || 0), 0)
@@ -734,7 +741,7 @@ export default function Events() {
       const baseSuggestions: Record<string, SuggestedMatch> = {}
 
       for (const ev of loadedEvents) {
-        const suggestion = suggestForEvent(ev)
+        const suggestion = suggestForEvent(ev, availableProjects)
         if (suggestion) {
           baseSuggestions[ev.id] = suggestion
           suggestedProjectIds.add(suggestion.projectId)
@@ -767,6 +774,7 @@ export default function Events() {
       }
 
       setEvents(loadedEvents)
+      setProjects(availableProjects)
       setLoadedEventSource(data.query?.source || eventSource)
       setWeeklyActualLoggedMinutes(loadedLoggedMinutes)
       setWeeklyLoggedMinutes(loadedCreditedMinutes)
@@ -784,7 +792,7 @@ export default function Events() {
     } finally {
       setLoading(false)
     }
-  }, [end, eventSource, loadDeskTicketsForProject, loadTasksForProject, start])
+  }, [end, eventSource, loadDeskTicketsForProject, loadTasksForProject, projects, start])
 
   useEffect(() => {
     if (autoLoadedRef.current) return
@@ -802,7 +810,7 @@ export default function Events() {
   const suggestedTaskForProject = (eventId: string, projectId: number, projectTasks: TeamworkTask[]) => {
     const ev = events.find(item => item.id === eventId)
     if (!ev) return null
-    const suggestion = refineSuggestionWithTasks(ev, suggestForEvent(ev), projectTasks)
+    const suggestion = refineSuggestionWithTasks(ev, suggestForEvent(ev, projects), projectTasks)
     if (suggestion?.projectId === projectId && suggestion.taskId) return suggestion.taskId
 
     const text = eventText(ev)
@@ -904,7 +912,7 @@ export default function Events() {
     const validProjectIds = new Set(projects.map(project => project.id))
     const existingMatch = matches[eventId]
     const event = events.find(item => item.id === eventId)
-    const suggestedProjectId = event ? suggestForEvent(event)?.projectId : null
+    const suggestedProjectId = event ? suggestForEvent(event, projects)?.projectId : null
     const linkedProjectId = ticket.projectIds?.find(projectId => validProjectIds.has(projectId))
       || (existingMatch?.projectId && validProjectIds.has(existingMatch.projectId) ? existingMatch.projectId : null)
       || (suggestedProjectId && validProjectIds.has(suggestedProjectId) ? suggestedProjectId : null)
@@ -1255,7 +1263,7 @@ export default function Events() {
           const match = matches[ev.id]
           const selectedProject = match?.projectId
           const selectedTask = match?.taskId
-          const baseSuggestion = suggestForEvent(ev)
+          const baseSuggestion = suggestForEvent(ev, projects)
           const suggestion = refineSuggestionWithTasks(
             ev,
             baseSuggestion,
