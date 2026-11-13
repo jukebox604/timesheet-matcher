@@ -17,6 +17,7 @@ from app.models import init_db, insert_proposal
 from app.matcher import match_and_propose
 from app.auth import router as auth_router
 from app.google_calendar import list_google_calendar_events, google_calendar_configured
+from app.description_cleanup import strip_email_description
 
 EXCLUDED_MATCHING_EVENT_TITLES = (
     "am email review",
@@ -152,6 +153,7 @@ def _clean_event_description(description: str | None) -> str:
         r"(?:\n(?:[ \t]*\n)*[ \t]*[─━]{8,}[ \t]*)?(?:\n|$)",
         "", text,
     )
+    text = strip_email_description(text)
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
